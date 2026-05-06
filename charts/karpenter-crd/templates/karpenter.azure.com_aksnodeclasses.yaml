@@ -735,6 +735,17 @@ spec:
                       https://learn.microsoft.com/en-us/azure/virtual-machines/disk-encryption#encryption-at-host---end-to-end-encryption-for-your-vm-data
                     type: boolean
                 type: object
+              spotMaxPrice:
+                description: |-
+                  spotMaxPrice is the maximum price (in USD) you are willing to pay for spot instances.
+                  Must be a positive decimal string with up to 5 decimal places (e.g. "0.98765").
+                  If not set, the instance will not be evicted based on price; the max price will be the on-demand price.
+                  This field is only effective when the node class is used with spot capacity type; it is ignored for on-demand nodes.
+                pattern: ^[0-9]+(\.[0-9]{1,5})?$
+                type: string
+                x-kubernetes-validations:
+                - message: spotMaxPrice must be a value greater than 0
+                  rule: double(self) > 0.0
               tags:
                 additionalProperties:
                   type: string
@@ -1601,6 +1612,17 @@ spec:
                       https://learn.microsoft.com/en-us/azure/virtual-machines/disk-encryption#encryption-at-host---end-to-end-encryption-for-your-vm-data
                     type: boolean
                 type: object
+              spotMaxPrice:
+                description: |-
+                  spotMaxPrice is the maximum price (in USD) you are willing to pay for spot instances.
+                  Must be a positive decimal string with up to 5 decimal places (e.g. "0.98765").
+                  If not set, the instance will not be evicted based on price; the max price will be the on-demand price.
+                  This field is only effective when the node class is used with spot capacity type; it is ignored for on-demand nodes.
+                pattern: ^[0-9]+(\.[0-9]{1,5})?$
+                type: string
+                x-kubernetes-validations:
+                - message: spotMaxPrice must be a value greater than 0
+                  rule: double(self) > 0.0
               tags:
                 additionalProperties:
                   type: string

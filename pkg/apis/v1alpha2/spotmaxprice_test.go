@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1beta1_test
+package v1alpha2_test
 
 import (
 	"testing"
 
-	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1alpha2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 )
@@ -58,7 +58,7 @@ func TestParseSpotMaxPrice(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
-			result, err := v1beta1.ParseSpotMaxPrice(tt.input)
+			result, err := v1alpha2.ParseSpotMaxPrice(tt.input)
 			if tt.expectError {
 				g.Expect(err).To(HaveOccurred(), "expected error for input %q", tt.input)
 			} else {
@@ -73,7 +73,7 @@ func TestSpotMaxPriceFixedMethod(t *testing.T) {
 	g := NewWithT(t)
 
 	// nil SpotMaxPrice returns nil
-	spec := &v1beta1.AKSNodeClassSpec{}
+	spec := &v1alpha2.AKSNodeClassSpec{}
 	result, err := spec.SpotMaxPriceFixed()
 	g.Expect(err).To(BeNil())
 	g.Expect(result).To(BeNil())
