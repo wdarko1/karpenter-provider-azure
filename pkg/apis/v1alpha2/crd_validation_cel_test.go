@@ -856,15 +856,15 @@ var _ = Describe("CEL/Validation", func() {
 					Expect(env.Client.Create(ctx, nodeClass)).ToNot(Succeed())
 				}
 			},
-			Entry("valid: -1 (no price-based eviction)", "-1", true),
+			Entry("invalid: -1 (sentinel no longer accepted)", "-1", false),
 			Entry("valid: 0.5", "0.5", true),
 			Entry("valid: 0.98765 (five decimal places)", "0.98765", true),
 			Entry("valid: 100.0", "100.0", true),
 			Entry("invalid: 0 (zero is not allowed)", "0", false),
 			Entry("invalid: 0.0 (zero is not allowed)", "0.0", false),
 			Entry("invalid: 0.00000 (zero is not allowed)", "0.00000", false),
-			Entry("invalid: -0.5 (negative other than -1)", "-0.5", false),
-			Entry("invalid: -2 (negative other than -1)", "-2", false),
+			Entry("invalid: -0.5 (negative)", "-0.5", false),
+			Entry("invalid: -2 (negative)", "-2", false),
 			Entry("invalid: too many decimal places", "1.234567", false),
 			Entry("invalid: non-numeric", "abc", false),
 		)

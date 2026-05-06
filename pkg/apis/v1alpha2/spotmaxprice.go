@@ -23,13 +23,11 @@ import (
 )
 
 // SpotMaxPriceFixed returns the SpotMaxPrice normalized to 1e-5 USD units (integer fixed-point).
-// Returns nil, nil for a nil SpotMaxPrice.
-// Returns -1 for the sentinel value "-1" (no price-based eviction).
+// Returns nil, nil when SpotMaxPrice is not set (nil), meaning no price cap (Azure default behavior).
 // Returns the value * 100000 for valid positive decimal strings.
 // Examples:
 //
 //	nil      -> nil, nil
-//	"-1"     -> -1, nil
 //	"2"      -> 200000, nil
 //	"0.98765" -> 98765, nil
 func (s *AKSNodeClassSpec) SpotMaxPriceFixed() (*int64, error) {
@@ -40,18 +38,14 @@ func (s *AKSNodeClassSpec) SpotMaxPriceFixed() (*int64, error) {
 }
 
 // ParseSpotMaxPrice parses a spot max price string into a fixed-point integer (USD * 100000).
-// It accepts "-1" (sentinel) or positive decimal strings with up to 5 decimal places.
-// It rejects zero, negatives other than -1, more than 5 decimal places, and non-numeric strings.
+// It accepts positive decimal strings with up to 5 decimal places.
+// It rejects zero, negative values, more than 5 decimal places, and non-numeric strings.
 func ParseSpotMaxPrice(v string) (*int64, error) {
 	v = strings.TrimSpace(v)
-	if v == "-1" {
-		x := int64(-1)
-		return &x, nil
-	}
 
-	// Reject any leading minus (only -1 is allowed negative)
+	// Reject any leading minus
 	if strings.HasPrefix(v, "-") {
-		return nil, fmt.Errorf("spotMaxPrice %q must be \"-1\" or a value greater than 0", v)
+		return nil, fmt.Errorf("spotMaxPrice %q must be a value greater than 0", v)
 	}
 
 	parts := strings.SplitN(v, ".", 2)
@@ -85,7 +79,7 @@ func ParseSpotMaxPrice(v string) (*int64, error) {
 
 	fixed := whole*100000 + frac
 	if fixed <= 0 {
-		return nil, fmt.Errorf("spotMaxPrice must be \"-1\" or a value greater than 0, got %q", v)
+		return nil, fmt.Errorf("spotMaxPrice must be a value greater than 0, got %q", v)
 	}
 	result := fixed
 	return &result, nil

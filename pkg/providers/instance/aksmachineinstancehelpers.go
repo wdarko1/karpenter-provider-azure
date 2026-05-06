@@ -263,7 +263,8 @@ func configurePriority(capacityType string) *armcontainerservice.ScaleSetPriorit
 }
 
 // configureSpotBilling returns a MachineBillingProfile for Spot capacity type using the
-// SpotMaxPrice from the NodeClass, defaulting to -1 (no price-based eviction) when not specified.
+// SpotMaxPrice from the NodeClass. When SpotMaxPrice is not set, MaxPrice is omitted and
+// Azure defaults to the on-demand price (no price-based eviction).
 // Returns nil for non-Spot capacity types.
 func configureSpotBilling(capacityType string, nodeClass *v1beta1.AKSNodeClass) (*armcontainerservice.MachineBillingProfile, error) {
 	if capacityType != karpv1.CapacityTypeSpot {
@@ -273,13 +274,12 @@ func configureSpotBilling(capacityType string, nodeClass *v1beta1.AKSNodeClass) 
 	if err != nil {
 		return nil, fmt.Errorf("parsing spotMaxPrice: %w", err)
 	}
-	maxPrice := float32(-1)
-	if fixed != nil && *fixed != -1 {
-		maxPrice = float32(*fixed) / 100000.0
+	billing := &armcontainerservice.MachineBillingProfile{}
+	if fixed != nil {
+		maxPrice := float32(*fixed) / 100000.0
+		billing.SpotMaxPrice = lo.ToPtr(maxPrice)
 	}
-	return &armcontainerservice.MachineBillingProfile{
-		SpotMaxPrice: lo.ToPtr(maxPrice),
-	}, nil
+	return billing, nil
 }
 
 func configureOSSKUAndFIPs(nodeClass *v1beta1.AKSNodeClass, orchestratorVersion string) (*armcontainerservice.OSSKU, *bool, error) {

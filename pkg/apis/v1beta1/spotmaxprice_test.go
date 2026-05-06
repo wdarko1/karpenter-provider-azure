@@ -31,18 +31,19 @@ func TestParseSpotMaxPrice(t *testing.T) {
 		expectError bool
 		expectVal   *int64
 	}{
-		{name: "-1 sentinel", input: "-1", expectError: false, expectVal: lo.ToPtr(int64(-1))},
 		{name: "whole number 1", input: "1", expectError: false, expectVal: lo.ToPtr(int64(100000))},
 		{name: "whole number 2", input: "2", expectError: false, expectVal: lo.ToPtr(int64(200000))},
 		{name: "one decimal 1.2", input: "1.2", expectError: false, expectVal: lo.ToPtr(int64(120000))},
 		{name: "five decimals 0.00001", input: "0.00001", expectError: false, expectVal: lo.ToPtr(int64(1))},
 		{name: "five decimals 0.98765", input: "0.98765", expectError: false, expectVal: lo.ToPtr(int64(98765))},
 		{name: "large value 100.0", input: "100.0", expectError: false, expectVal: lo.ToPtr(int64(10000000))},
+		// Invalid: -1 is no longer a valid sentinel
+		{name: "sentinel -1 rejected", input: "-1", expectError: true},
 		// Invalid: zero
 		{name: "zero integer", input: "0", expectError: true},
 		{name: "zero decimal 0.0", input: "0.0", expectError: true},
 		{name: "zero 5 decimals 0.00000", input: "0.00000", expectError: true},
-		// Invalid: negatives other than -1
+		// Invalid: negatives
 		{name: "negative -0.1", input: "-0.1", expectError: true},
 		{name: "negative -2", input: "-2", expectError: true},
 		// Invalid: more than 5 decimal places
@@ -76,13 +77,6 @@ func TestSpotMaxPriceFixedMethod(t *testing.T) {
 	result, err := spec.SpotMaxPriceFixed()
 	g.Expect(err).To(BeNil())
 	g.Expect(result).To(BeNil())
-
-	// "-1" returns -1
-	spec.SpotMaxPrice = lo.ToPtr("-1")
-	result, err = spec.SpotMaxPriceFixed()
-	g.Expect(err).To(BeNil())
-	g.Expect(result).ToNot(BeNil())
-	g.Expect(*result).To(Equal(int64(-1)))
 
 	// "0.98765" returns 98765
 	spec.SpotMaxPrice = lo.ToPtr("0.98765")

@@ -657,21 +657,19 @@ func setImageReference(vmProperties *armcompute.VirtualMachineProperties, imageI
 	}
 }
 
-// setVMPropertiesBillingProfile sets the MaxPrice for Spot VMs using the value from the NodeClass,
-// defaulting to -1 (no price-based eviction) when not specified.
+// setVMPropertiesBillingProfile sets the EvictionPolicy and optionally the MaxPrice for Spot VMs.
+// When SpotMaxPrice is not set, MaxPrice is omitted and Azure defaults to the on-demand price (no price-based eviction).
 func setVMPropertiesBillingProfile(vmProperties *armcompute.VirtualMachineProperties, capacityType string, nodeClass *v1beta1.AKSNodeClass) error {
 	if capacityType == karpv1.CapacityTypeSpot {
 		fixed, err := nodeClass.Spec.SpotMaxPriceFixed()
 		if err != nil {
 			return fmt.Errorf("parsing spotMaxPrice: %w", err)
 		}
-		maxPrice := float64(-1)
-		if fixed != nil && *fixed != -1 {
-			maxPrice = float64(*fixed) / 100000.0
-		}
 		vmProperties.EvictionPolicy = lo.ToPtr(armcompute.VirtualMachineEvictionPolicyTypesDelete)
-		vmProperties.BillingProfile = &armcompute.BillingProfile{
-			MaxPrice: lo.ToPtr(maxPrice),
+		vmProperties.BillingProfile = &armcompute.BillingProfile{}
+		if fixed != nil {
+			maxPrice := float64(*fixed) / 100000.0
+			vmProperties.BillingProfile.MaxPrice = lo.ToPtr(maxPrice)
 		}
 	}
 	return nil
