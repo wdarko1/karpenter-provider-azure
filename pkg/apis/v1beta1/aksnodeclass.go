@@ -133,11 +133,11 @@ type AKSNodeClassSpec struct {
 	// +optional
 	LinuxOSConfig *LinuxOSConfiguration `json:"linuxOSConfig,omitempty"`
 	// spotMaxPrice is the maximum price (in USD) you are willing to pay for spot instances.
-	// Valid values are "-1" or a positive decimal string with up to 5 decimal places (e.g. "0.98765").
-	// Setting "-1" means the instance will not be evicted based on price; the max price will be the on-demand price.
+	// Must be a positive decimal string with up to 5 decimal places (e.g. "0.98765").
+	// If not set, the instance will not be evicted based on price; the max price will be the on-demand price.
 	// This field is only effective when the node class is used with spot capacity type; it is ignored for on-demand nodes.
-	// +kubebuilder:validation:Pattern=`^(-1|[0-9]+(\.[0-9]{1,5})?)$`
-	// +kubebuilder:default="-1"
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]{1,5})?$`
+	// +kubebuilder:validation:XValidation:rule="double(self) > 0.0",message="spotMaxPrice must be a value greater than 0"
 	// +optional
 	SpotMaxPrice *string `json:"spotMaxPrice,omitempty"`
 }
