@@ -98,6 +98,12 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 	// Note: as of the time of writing, AKS machine API does not support tags on NICs. This could be fixed server-side.
 	tags := ConfigureAKSMachineTags(options.FromContext(ctx), nodeClass, nodeClaim)
 
+	// Billing (spot max price)
+	billing, err := configureSpotBilling(capacityType, nodeClass)
+	if err != nil {
+		return nil, err
+	}
+
 	return &armcontainerservice.Machine{
 		Zones: zones.MakeARMZonesFromAKSLabelZone(zone),
 		Properties: &armcontainerservice.MachineProperties{
@@ -142,7 +148,7 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 				NodeTaints:               nodeTaints,
 				MaxPods:                  nodeClass.Spec.MaxPods, // AKS machine API defaults it per network plugins if nil.
 				// WorkloadRuntime:          nil,
-				// ArtifactStreamingProfile: nil,
+				ArtifactStreamingProfile: configureArtifactStreamingProfile(nodeClass, instanceType),
 			},
 
 			Mode: modePtr,
@@ -153,8 +159,10 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 				// EnableSecureBoot:       nil,
 			},
 			Priority: priority,
+			Billing:  billing,
 
-			Tags: tags,
+			Tags:            tags,
+			LocalDNSProfile: configureLocalDNSProfile(nodeClass),
 		},
 	}, nil
 }
@@ -168,6 +176,66 @@ func configureGPUProfile(instanceType *corecloudprovider.InstanceType) *armconta
 		}
 	}
 	return nil
+}
+
+func configureArtifactStreamingProfile(nodeClass *v1beta1.AKSNodeClass, instanceType *corecloudprovider.InstanceType) *armcontainerservice.AgentPoolArtifactStreamingProfile {
+	arch := instanceType.Requirements.Get(v1.LabelArchStable).Values()[0]
+	if nodeClass.IsArtifactStreamingEnabled(arch) {
+		return &armcontainerservice.AgentPoolArtifactStreamingProfile{
+			Enabled: lo.ToPtr(true),
+		}
+	}
+	return nil
+}
+
+func configureLocalDNSProfile(nodeClass *v1beta1.AKSNodeClass) *armcontainerservice.LocalDNSProfile {
+	if nodeClass.Spec.LocalDNS == nil {
+		return nil
+	}
+	profile := &armcontainerservice.LocalDNSProfile{}
+	if nodeClass.Spec.LocalDNS.Mode != "" {
+		profile.Mode = lo.ToPtr(armcontainerservice.LocalDNSMode(nodeClass.Spec.LocalDNS.Mode))
+	}
+	if len(nodeClass.Spec.LocalDNS.VnetDNSOverrides) > 0 {
+		profile.VnetDNSOverrides = convertLocalDNSOverrides(nodeClass.Spec.LocalDNS.VnetDNSOverrides)
+	}
+	if len(nodeClass.Spec.LocalDNS.KubeDNSOverrides) > 0 {
+		profile.KubeDNSOverrides = convertLocalDNSOverrides(nodeClass.Spec.LocalDNS.KubeDNSOverrides)
+	}
+	return profile
+}
+
+func convertLocalDNSOverrides(overrides []v1beta1.LocalDNSZoneOverride) map[string]*armcontainerservice.LocalDNSOverride {
+	result := make(map[string]*armcontainerservice.LocalDNSOverride, len(overrides))
+	for _, o := range overrides {
+		override := &armcontainerservice.LocalDNSOverride{}
+		if o.QueryLogging != "" {
+			override.QueryLogging = lo.ToPtr(armcontainerservice.LocalDNSQueryLogging(o.QueryLogging))
+		}
+		if o.Protocol != "" {
+			override.Protocol = lo.ToPtr(armcontainerservice.LocalDNSProtocol(o.Protocol))
+		}
+		if o.ForwardDestination != "" {
+			override.ForwardDestination = lo.ToPtr(armcontainerservice.LocalDNSForwardDestination(o.ForwardDestination))
+		}
+		if o.ForwardPolicy != "" {
+			override.ForwardPolicy = lo.ToPtr(armcontainerservice.LocalDNSForwardPolicy(o.ForwardPolicy))
+		}
+		if o.MaxConcurrent != nil {
+			override.MaxConcurrent = o.MaxConcurrent
+		}
+		if o.CacheDuration.Duration != nil {
+			override.CacheDurationInSeconds = lo.ToPtr(int32(o.CacheDuration.Seconds()))
+		}
+		if o.ServeStaleDuration.Duration != nil {
+			override.ServeStaleDurationInSeconds = lo.ToPtr(int32(o.ServeStaleDuration.Seconds()))
+		}
+		if o.ServeStale != "" {
+			override.ServeStale = lo.ToPtr(armcontainerservice.LocalDNSServeStale(o.ServeStale))
+		}
+		result[o.Zone] = override
+	}
+	return result
 }
 
 func configureOSDiskType(ctx context.Context, instanceTypeProvider instancetype.Provider, nodeClass *v1beta1.AKSNodeClass, instanceType *corecloudprovider.InstanceType) (*armcontainerservice.OSDiskType, error) {
@@ -192,6 +260,26 @@ func configurePriority(capacityType string) *armcontainerservice.ScaleSetPriorit
 		// Karpenter defaults to Regular
 		return lo.ToPtr(armcontainerservice.ScaleSetPriorityRegular)
 	}
+}
+
+// configureSpotBilling returns a MachineBillingProfile for Spot capacity type using the
+// SpotMaxPrice from the NodeClass. When SpotMaxPrice is not set, MaxPrice is omitted and
+// Azure defaults to the on-demand price (no price-based eviction).
+// Returns nil for non-Spot capacity types.
+func configureSpotBilling(capacityType string, nodeClass *v1beta1.AKSNodeClass) (*armcontainerservice.MachineBillingProfile, error) {
+	if capacityType != karpv1.CapacityTypeSpot {
+		return nil, nil
+	}
+	fixed, err := nodeClass.Spec.SpotMaxPriceFixed()
+	if err != nil {
+		return nil, fmt.Errorf("parsing spotMaxPrice: %w", err)
+	}
+	billing := &armcontainerservice.MachineBillingProfile{}
+	if fixed != nil {
+		maxPrice := float32(*fixed) / 100000.0
+		billing.SpotMaxPrice = lo.ToPtr(maxPrice)
+	}
+	return billing, nil
 }
 
 func configureOSSKUAndFIPs(nodeClass *v1beta1.AKSNodeClass, orchestratorVersion string) (*armcontainerservice.OSSKU, *bool, error) {

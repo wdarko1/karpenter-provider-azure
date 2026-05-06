@@ -550,9 +550,9 @@ type createVMOptions struct {
 }
 
 // newVMObject creates a new armcompute.VirtualMachine from the provided options
-func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
+func newVMObject(opts *createVMOptions) (*armcompute.VirtualMachine, error) {
 	if opts.LaunchTemplate.IsWindows {
-		return &armcompute.VirtualMachine{} // TODO(Windows)
+		return &armcompute.VirtualMachine{}, nil // TODO(Windows)
 	}
 
 	vm := &armcompute.VirtualMachine{
@@ -608,7 +608,9 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	setVMPropertiesOSDiskType(vm.Properties, opts.LaunchTemplate)
 	setVMPropertiesOSDiskEncryption(vm.Properties, opts.DiskEncryptionSetID)
 	setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
-	setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType)
+	if err := setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType, opts.NodeClass); err != nil {
+		return nil, err
+	}
 	setVMPropertiesSecurityProfile(vm.Properties, opts.NodeClass)
 
 	if opts.ProvisionMode == consts.ProvisionModeBootstrappingClient {
@@ -617,7 +619,7 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 		vm.Properties.OSProfile.CustomData = lo.ToPtr(opts.LaunchTemplate.ScriptlessCustomData)
 	}
 
-	return vm
+	return vm, nil
 }
 
 func setVMPropertiesOSDiskType(vmProperties *armcompute.VirtualMachineProperties, launchTemplate *launchtemplate.Template) {
@@ -655,14 +657,22 @@ func setImageReference(vmProperties *armcompute.VirtualMachineProperties, imageI
 	}
 }
 
-// setVMPropertiesBillingProfile sets a default MaxPrice of -1 for Spot
-func setVMPropertiesBillingProfile(vmProperties *armcompute.VirtualMachineProperties, capacityType string) {
+// setVMPropertiesBillingProfile sets the EvictionPolicy and optionally the MaxPrice for Spot VMs.
+// When SpotMaxPrice is not set, MaxPrice is omitted and Azure defaults to the on-demand price (no price-based eviction).
+func setVMPropertiesBillingProfile(vmProperties *armcompute.VirtualMachineProperties, capacityType string, nodeClass *v1beta1.AKSNodeClass) error {
 	if capacityType == karpv1.CapacityTypeSpot {
+		fixed, err := nodeClass.Spec.SpotMaxPriceFixed()
+		if err != nil {
+			return fmt.Errorf("parsing spotMaxPrice: %w", err)
+		}
 		vmProperties.EvictionPolicy = lo.ToPtr(armcompute.VirtualMachineEvictionPolicyTypesDelete)
-		vmProperties.BillingProfile = &armcompute.BillingProfile{
-			MaxPrice: lo.ToPtr(float64(-1)),
+		vmProperties.BillingProfile = &armcompute.BillingProfile{}
+		if fixed != nil {
+			maxPrice := float64(*fixed) / 100000.0
+			vmProperties.BillingProfile.MaxPrice = lo.ToPtr(maxPrice)
 		}
 	}
+	return nil
 }
 
 func setVMPropertiesSecurityProfile(vmProperties *armcompute.VirtualMachineProperties, nodeClass *v1beta1.AKSNodeClass) {
@@ -701,7 +711,10 @@ func (p *DefaultVMProvider) createVirtualMachine(ctx context.Context, opts *crea
 	if !sdkerrors.IsNotFoundErr(err) {
 		return nil, fmt.Errorf("getting VM %q: %w", opts.VMName, err)
 	}
-	vm := newVMObject(opts)
+	vm, err := newVMObject(opts)
+	if err != nil {
+		return nil, fmt.Errorf("building VM object for %q: %w", opts.VMName, err)
+	}
 	log.FromContext(ctx).V(1).Info("creating virtual machine", "vmName", opts.VMName, logging.InstanceType, opts.InstanceType.Name)
 	VMCreateStartMetric.With(map[string]string{
 		metrics.ImageLabel:        opts.LaunchTemplate.ImageID,

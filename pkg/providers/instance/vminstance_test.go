@@ -19,9 +19,12 @@ package instance
 import (
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 )
@@ -101,6 +104,117 @@ func TestGetManagedExtensionNames(t *testing.T) {
 			result := GetManagedExtensionNames(tt.provisionMode, tt.env)
 
 			g.Expect(result).To(Equal(tt.expected))
+		})
+	}
+}
+
+func TestSetVMPropertiesBillingProfile(t *testing.T) {
+	tests := []struct {
+		name             string
+		capacityType     string
+		spotMaxPrice     *string
+		expectBilling    bool
+		expectMaxPrice   bool
+		expectedMaxPrice float64
+		expectEviction   bool
+		expectError      bool
+	}{
+		{
+			name:           "on-demand: no billing profile set",
+			capacityType:   karpv1.CapacityTypeOnDemand,
+			spotMaxPrice:   nil,
+			expectBilling:  false,
+			expectEviction: false,
+		},
+		{
+			name:           "spot with nil SpotMaxPrice: no MaxPrice set",
+			capacityType:   karpv1.CapacityTypeSpot,
+			spotMaxPrice:   nil,
+			expectBilling:  true,
+			expectMaxPrice: false,
+			expectEviction: true,
+		},
+		{
+			name:         "spot with SpotMaxPrice=-1 returns error",
+			capacityType: karpv1.CapacityTypeSpot,
+			spotMaxPrice: lo.ToPtr("-1"),
+			expectError:  true,
+		},
+		{
+			name:             "spot with SpotMaxPrice=0.5",
+			capacityType:     karpv1.CapacityTypeSpot,
+			spotMaxPrice:     lo.ToPtr("0.5"),
+			expectBilling:    true,
+			expectMaxPrice:   true,
+			expectedMaxPrice: 0.5,
+			expectEviction:   true,
+		},
+		{
+			name:             "spot with SpotMaxPrice=0.98765",
+			capacityType:     karpv1.CapacityTypeSpot,
+			spotMaxPrice:     lo.ToPtr("0.98765"),
+			expectBilling:    true,
+			expectMaxPrice:   true,
+			expectedMaxPrice: 0.98765,
+			expectEviction:   true,
+		},
+		{
+			name:             "spot with SpotMaxPrice=100.0",
+			capacityType:     karpv1.CapacityTypeSpot,
+			spotMaxPrice:     lo.ToPtr("100.0"),
+			expectBilling:    true,
+			expectMaxPrice:   true,
+			expectedMaxPrice: 100.0,
+			expectEviction:   true,
+		},
+		{
+			name:         "spot with invalid SpotMaxPrice=0 returns error",
+			capacityType: karpv1.CapacityTypeSpot,
+			spotMaxPrice: lo.ToPtr("0"),
+			expectError:  true,
+		},
+		{
+			name:         "spot with invalid SpotMaxPrice=abc returns error",
+			capacityType: karpv1.CapacityTypeSpot,
+			spotMaxPrice: lo.ToPtr("abc"),
+			expectError:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			nodeClass := &v1beta1.AKSNodeClass{}
+			nodeClass.Spec.SpotMaxPrice = tt.spotMaxPrice
+
+			vmProperties := &armcompute.VirtualMachineProperties{}
+			err := setVMPropertiesBillingProfile(vmProperties, tt.capacityType, nodeClass)
+
+			if tt.expectError {
+				g.Expect(err).To(HaveOccurred())
+				return
+			}
+			g.Expect(err).To(BeNil())
+
+			if tt.expectBilling {
+				g.Expect(vmProperties.BillingProfile).ToNot(BeNil())
+				if tt.expectMaxPrice {
+					g.Expect(vmProperties.BillingProfile.MaxPrice).ToNot(BeNil())
+					g.Expect(*vmProperties.BillingProfile.MaxPrice).To(Equal(tt.expectedMaxPrice))
+				} else {
+					g.Expect(vmProperties.BillingProfile.MaxPrice).To(BeNil())
+				}
+			} else {
+				g.Expect(vmProperties.BillingProfile).To(BeNil())
+			}
+
+			if tt.expectEviction {
+				g.Expect(vmProperties.EvictionPolicy).ToNot(BeNil())
+				g.Expect(*vmProperties.EvictionPolicy).To(Equal(armcompute.VirtualMachineEvictionPolicyTypesDelete))
+			} else {
+				g.Expect(vmProperties.EvictionPolicy).To(BeNil())
+			}
 		})
 	}
 }

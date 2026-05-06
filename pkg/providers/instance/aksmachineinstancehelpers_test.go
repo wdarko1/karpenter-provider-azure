@@ -892,4 +892,45 @@ var _ = Describe("AKSMachineInstance Helper Functions", func() {
 			})
 		})
 	})
+
+	Describe("configureSpotBilling", func() {
+		DescribeTable("should configure billing profile correctly",
+			func(capacityType string, spotMaxPrice *string, expectedBilling *armcontainerservice.MachineBillingProfile, expectError bool) {
+				nc := &v1beta1.AKSNodeClass{}
+				nc.Spec.SpotMaxPrice = spotMaxPrice
+				result, err := configureSpotBilling(capacityType, nc)
+				if expectError {
+					Expect(err).To(HaveOccurred())
+					return
+				}
+				Expect(err).To(BeNil())
+				if expectedBilling == nil {
+					Expect(result).To(BeNil())
+				} else {
+					Expect(result).ToNot(BeNil())
+					if expectedBilling.SpotMaxPrice == nil {
+						Expect(result.SpotMaxPrice).To(BeNil())
+					} else {
+						Expect(result.SpotMaxPrice).ToNot(BeNil())
+						Expect(*result.SpotMaxPrice).To(Equal(*expectedBilling.SpotMaxPrice))
+					}
+				}
+			},
+			Entry("on-demand: no billing profile", karpv1.CapacityTypeOnDemand, nil, nil, false),
+			Entry("spot with nil SpotMaxPrice: no MaxPrice set", karpv1.CapacityTypeSpot, nil,
+				&armcontainerservice.MachineBillingProfile{SpotMaxPrice: nil}, false),
+			Entry("spot with SpotMaxPrice=-1 returns error", karpv1.CapacityTypeSpot, lo.ToPtr("-1"),
+				nil, true),
+			Entry("spot with SpotMaxPrice=0.5", karpv1.CapacityTypeSpot, lo.ToPtr("0.5"),
+				&armcontainerservice.MachineBillingProfile{SpotMaxPrice: lo.ToPtr(float32(0.5))}, false),
+			Entry("spot with SpotMaxPrice=0.98765", karpv1.CapacityTypeSpot, lo.ToPtr("0.98765"),
+				&armcontainerservice.MachineBillingProfile{SpotMaxPrice: lo.ToPtr(float32(0.98765))}, false),
+			Entry("spot with SpotMaxPrice=100.0", karpv1.CapacityTypeSpot, lo.ToPtr("100.0"),
+				&armcontainerservice.MachineBillingProfile{SpotMaxPrice: lo.ToPtr(float32(100.0))}, false),
+			Entry("spot with invalid SpotMaxPrice=0 returns error", karpv1.CapacityTypeSpot, lo.ToPtr("0"),
+				nil, true),
+			Entry("spot with invalid SpotMaxPrice=abc returns error", karpv1.CapacityTypeSpot, lo.ToPtr("abc"),
+				nil, true),
+		)
+	})
 })
