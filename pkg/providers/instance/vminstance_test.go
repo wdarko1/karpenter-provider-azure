@@ -116,6 +116,7 @@ func TestSetVMPropertiesBillingProfile(t *testing.T) {
 		expectBilling    bool
 		expectedMaxPrice float64
 		expectEviction   bool
+		expectError      bool
 	}{
 		{
 			name:           "on-demand: no billing profile set",
@@ -164,6 +165,18 @@ func TestSetVMPropertiesBillingProfile(t *testing.T) {
 			expectedMaxPrice: 100.0,
 			expectEviction:   true,
 		},
+		{
+			name:         "spot with invalid SpotMaxPrice=0 returns error",
+			capacityType: karpv1.CapacityTypeSpot,
+			spotMaxPrice: lo.ToPtr("0"),
+			expectError:  true,
+		},
+		{
+			name:         "spot with invalid SpotMaxPrice=abc returns error",
+			capacityType: karpv1.CapacityTypeSpot,
+			spotMaxPrice: lo.ToPtr("abc"),
+			expectError:  true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -174,7 +187,13 @@ func TestSetVMPropertiesBillingProfile(t *testing.T) {
 			nodeClass.Spec.SpotMaxPrice = tt.spotMaxPrice
 
 			vmProperties := &armcompute.VirtualMachineProperties{}
-			setVMPropertiesBillingProfile(vmProperties, tt.capacityType, nodeClass)
+			err := setVMPropertiesBillingProfile(vmProperties, tt.capacityType, nodeClass)
+
+			if tt.expectError {
+				g.Expect(err).To(HaveOccurred())
+				return
+			}
+			g.Expect(err).To(BeNil())
 
 			if tt.expectBilling {
 				g.Expect(vmProperties.BillingProfile).ToNot(BeNil())

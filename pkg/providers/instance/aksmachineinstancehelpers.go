@@ -19,7 +19,6 @@ package instance
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
@@ -99,6 +98,12 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 	// Note: as of the time of writing, AKS machine API does not support tags on NICs. This could be fixed server-side.
 	tags := ConfigureAKSMachineTags(options.FromContext(ctx), nodeClass, nodeClaim)
 
+	// Billing (spot max price)
+	billing, err := configureSpotBilling(capacityType, nodeClass)
+	if err != nil {
+		return nil, err
+	}
+
 	return &armcontainerservice.Machine{
 		Zones: zones.MakeARMZonesFromAKSLabelZone(zone),
 		Properties: &armcontainerservice.MachineProperties{
@@ -154,7 +159,7 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 				// EnableSecureBoot:       nil,
 			},
 			Priority: priority,
-			Billing:  configureSpotBilling(capacityType, nodeClass),
+			Billing:  billing,
 
 			Tags:            tags,
 			LocalDNSProfile: configureLocalDNSProfile(nodeClass),
@@ -260,21 +265,21 @@ func configurePriority(capacityType string) *armcontainerservice.ScaleSetPriorit
 // configureSpotBilling returns a MachineBillingProfile for Spot capacity type using the
 // SpotMaxPrice from the NodeClass, defaulting to -1 (no price-based eviction) when not specified.
 // Returns nil for non-Spot capacity types.
-func configureSpotBilling(capacityType string, nodeClass *v1beta1.AKSNodeClass) *armcontainerservice.MachineBillingProfile {
+func configureSpotBilling(capacityType string, nodeClass *v1beta1.AKSNodeClass) (*armcontainerservice.MachineBillingProfile, error) {
 	if capacityType != karpv1.CapacityTypeSpot {
-		return nil
+		return nil, nil
+	}
+	fixed, err := nodeClass.Spec.SpotMaxPriceFixed()
+	if err != nil {
+		return nil, fmt.Errorf("parsing spotMaxPrice: %w", err)
 	}
 	maxPrice := float32(-1)
-	if nodeClass.Spec.SpotMaxPrice != nil && *nodeClass.Spec.SpotMaxPrice != "-1" {
-		// The SpotMaxPrice string has already been validated by the CRD pattern,
-		// so ParseFloat should never fail here in normal operation.
-		if parsed, err := strconv.ParseFloat(*nodeClass.Spec.SpotMaxPrice, 32); err == nil {
-			maxPrice = float32(parsed)
-		}
+	if fixed != nil && *fixed != -1 {
+		maxPrice = float32(*fixed) / 100000.0
 	}
 	return &armcontainerservice.MachineBillingProfile{
 		SpotMaxPrice: lo.ToPtr(maxPrice),
-	}
+	}, nil
 }
 
 func configureOSSKUAndFIPs(nodeClass *v1beta1.AKSNodeClass, orchestratorVersion string) (*armcontainerservice.OSSKU, *bool, error) {

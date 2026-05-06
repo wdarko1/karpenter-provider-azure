@@ -137,6 +137,7 @@ type AKSNodeClassSpec struct {
 	// Setting "-1" means the instance will not be evicted based on price; the max price will be the on-demand price.
 	// This field is only effective when the node class is used with spot capacity type; it is ignored for on-demand nodes.
 	// +kubebuilder:validation:Pattern=`^(-1|[0-9]+(\.[0-9]{1,5})?)$`
+	// +kubebuilder:validation:XValidation:rule="self == '-1' || double(self) > 0.0",message="spotMaxPrice must be '-1' or a value greater than 0"
 	// +kubebuilder:default="-1"
 	// +optional
 	SpotMaxPrice *string `json:"spotMaxPrice,omitempty"`
