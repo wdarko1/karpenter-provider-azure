@@ -1,597 +1,626 @@
-# Guidance: Enabling a New Azure/AKS Feature in Karpenter
+# Contributor Guide: Enabling an Azure or AKS Feature in Karpenter
 
-**Last updated:** August 27, 2026
+**Last updated:** November 10, 2026
 
 **Status:** Guidance
 
 ## Overview
 
-A checklist and set of callouts for contributors adding
-support for an Azure or AKS feature that Karpenter/NAP does not yet expose. Derived from
-how features such as `security.encryptionAtHost`, `security.trustedLaunch`, `artifactStreaming`, `localDNS`,
-`gpu.mode`, `linuxOSConfig`, and Ultra SSD actually landed.
+Use this guide when adding support for an Azure or AKS capability that the provider
+does not yet expose. It takes you from a feature proposal to a reviewable implementation,
+including scheduling, provisioning, upgrades, and real-Azure evidence.
 
-It does not replace a feature-specific design doc. Write one from
-[`0000-TEMPLATE.md`](./0000-TEMPLATE.md), including its **FAQ**, **Testing**, and
-**Production Readiness** sections.
+The same code serves AKS-managed Node Auto Provisioning (NAP) and self-hosted Karpenter.
+A change can compile and pass isolated tests while still breaking one deployment model,
+one provisioning mode, or existing clusters. This guide helps you find those seams.
 
-### Goals
+Start with [CONTRIBUTING.md](../CONTRIBUTING.md) for development setup, the Contributor
+License Agreement (CLA), and the code of conduct. Read [AGENTS.md](../AGENTS.md) for the
+architecture and repository conventions. This guide complements those documents; it
+does not replace a feature-specific design or maintainer review.
 
-* Give contributors the decision framework and the file-level checklist in one place.
-* Surface the failure modes that have historically required a revert or a follow-up PR.
-* Make review expectations explicit before code is written.
+**How to use it:** follow the workflow below, then use the implementation sections that
+apply to your feature. Record "not applicable" with a reason rather than making unrelated
+changes to satisfy every checklist item. Completing the checklist strengthens a
+contribution; it does not guarantee acceptance or authorize a new public API.
 
-### Non-Goals
+### Contents
 
-* Restate `make verify` / CI enforcement.
-* Replace [`0015-nodeclass-vs-labels.md`](./0015-nodeclass-vs-labels.md), the authority on
-  the label-vs-NodeClass decision.
-* Cover non-feature work (refactors, dependency bumps).
+* [Contributor workflow](#contributor-workflow)
+* [Terms and provisioning modes](#terms-and-provisioning-modes)
+* [1. Establish the feature contract](#1-establish-the-feature-contract)
+* [2. Choose the user-facing surface](#2-choose-the-user-facing-surface)
+* [3. Define defaults and validation](#3-define-defaults-and-validation)
+* [4. Implement scheduling and cache correctness](#4-implement-scheduling-and-cache-correctness)
+* [5. Resolve external state and readiness](#5-resolve-external-state-and-readiness)
+* [6. Wire provisioning and resource lifecycle](#6-wire-provisioning-and-resource-lifecycle)
+* [7. Prove upgrade, drift, and update behavior](#7-prove-upgrade-drift-and-update-behavior)
+* [8. Build the evidence and run checks](#8-build-the-evidence-and-run-checks)
+* [9. Plan rollout and recovery](#9-plan-rollout-and-recovery)
+* [10. Prepare the pull request](#10-prepare-the-pull-request)
+* [Ready-for-review checklist](#ready-for-review-checklist)
+* [Appendix: implementation examples and lessons](#appendix-implementation-examples-and-lessons)
 
----
+## Contributor workflow
 
-## Step -1: Readiness gate
+| Stage | What to do | Evidence to bring to review |
+|---|---|---|
+| Discuss | Open or find an upstream issue describing the workload problem, AKS support, and proposed scope. Ask for feedback before committing to a public API. | Problem statement, public platform references, and unresolved questions. |
+| Design | Use [the design template](./0000-TEMPLATE.md). Include FAQ, testing, and production readiness even though the template marks some sections optional. | Feature contract, surface choice, compatibility matrix, and lifecycle decisions. |
+| Implement | Extend existing helpers and tests. Trace the value from user input to scheduling, Azure payload, and the actual node. | Small, coherent diff covering each claimed path. |
+| Verify | Run local checks and arrange relevant Azure-backed tests. Explain unavailable infrastructure early. | Commands, results, tested revision, and remaining gaps. |
+| Submit | Follow [the PR template](../.github/pull-request-template.md), link the issue/design, and respond to review with evidence. | User documentation, release note, and the checklist at the end of this guide. |
 
-Answer these before writing code. Each maps to a question a reviewer has actually asked.
+Use a draft PR for early feedback. Where changes can be reviewed independently, separate
+an SDK prerequisite, API decision, and implementation into coordinated PRs; identify
+dependencies and keep incomplete behavior from being exposed as supported.
 
-1. **Does the downstream support exist today?** Check the vendored SDK for the
-   corresponding `Machine*Profile` field and confirm the RP/agentbaker accepts it in your
-   target regions. For example - `LocalDNSProfile` did not exist on `MachineProperties` until the
-   armcontainerservice v9 bump (#1609), which is why #1610 was a separate, later PR.
+**External contributors:** you do not need access to private AKS systems to propose or
+explain a feature. If platform behavior cannot be confirmed from public documentation,
+SDK definitions, or a reproducible experiment, flag the uncertainty and ask maintainers
+for clarification. Do not invent defaults or present unrun tests as passing.
 
-2. **What is the AKS AgentPool API default?** Look it up first. See the worked failure in
-   Step 1 — getting this wrong cost three PRs and a deleted helper function.
+## Terms and provisioning modes
 
-3. **Is it configurable at the cluster (MC) level as well as per-pool?** If both, state
-   what happens when they disagree. From #1704: *"Concerned about defining this on the
-   AKSNodeClass for machine api, when it will also be configurable on the MC. Might lead
-   to unexpected states."*
+| Term | Meaning in this guide |
+|---|---|
+| AKSNodeClass | Provider-specific configuration describing how to create nodes. |
+| NodePool | Karpenter policy and scheduling requirements for a group of nodes. |
+| NodeClaim | Karpenter's request for, and lifecycle record of, an individual node. |
+| SKU / offering | An Azure VM size / a capacity option for a size, placement, and capacity type. Capability can vary by zone. |
+| NAP / self-hosted | AKS-managed Node Auto Provisioning / an installation operated by the user. |
+| MC / AgentPool | AKS ManagedCluster / node-pool API resource. Neither is the Karpenter NodePool resource. |
+| RP / SDK | Azure resource provider accepting API requests / the client library used to send them. An SDK field alone does not establish service support. |
+| Bootstrap / NPS | Configuration that prepares the VM as a Kubernetes node / the AKS node-provisioning service used by relevant bootstrap paths. |
+| CEL / RBAC | Common Expression Language for CRD validation / role-based access control. Kubernetes RBAC and Azure role assignments are separate permissions. |
+| Drift / in-place update | A difference that can require replacement / a supported change to an existing resource without replacement. |
 
-4. **Is it mutable after creation?** For example - Ultra SSD can only be set at cluster or nodepool
-   creation. Reviewers pushed back on that as unusual for a pool-level feature and asked
-   *why*. If AKS forbids post-creation change, say so and confirm CEL/drift match.
+The deployment model and provisioning mode are different dimensions. Do not assume every
+combination is available to every contributor or supported by a particular feature.
 
-5. **How does the AKS API validate it, and does Karpenter provably oblige the same rule?**
-   From #1704: *"'prove' that Karpenter obliges it... so that we can avoid provisioning
-   time failures or accidentally having to support what AKS doesn't."*
+| Mode | Implementation family | What must be checked |
+|---|---|---|
+| `aksscriptless` | VM-based | Direct VM properties, image/bootstrap settings, NICs, and cleanup. |
+| `bootstrappingclient` | VM-based | VM properties plus the bootstrap service request and response. |
+| `aksmachineapi` | AKS Machine API | Machine template/profile, service defaults, and lifecycle. |
+| `aksmachineapiheaderbatch` | AKS Machine API | Same behavior as `aksmachineapi`, plus shared-template grouping, per-machine header fields, and partial failure. |
 
-6. **What are the costs or tradeoffs of enabling this feature?**
-   Flag or test for any potential regression scenarios. State the measured effect on provisioning latency and per-node Azure API calls, or state why there is none.
+Mode definitions live in [consts.go](../pkg/consts/consts.go); configuration lives in
+[operator/options](../pkg/operator/options/). Consult the source at your working revision,
+not a mode or version list copied from an older PR.
 
-7. **What is the removal cost?** From #1676: a label used only on the
-   `bootstrappingclient` path becomes a future user-facing removal, because that path is
-   planned for deprecation.
+## 1. Establish the feature contract
 
-8. **Do you have a kill switch?** See Step 1.
+Before writing implementation code, answer these in the issue or design:
 
-> **Never ship a label or selector for a capability you cannot yet honor.** #872 was a
-> BREAKING change removing `sku-encryptionathost-capable` for exactly this reason.
+1. **What user problem is solved?** Include a representative workload, desired node
+   behavior, and explicit non-goals. Distinguish enabling a capability from advertising
+   that a SKU supports it.
+2. **Does the downstream support exist?** Check the dependency version in
+   [go.mod](../go.mod), its SDK request types, the API version, and public AKS/Azure
+   documentation. Confirm applicable region/cloud availability, preview registration,
+   Kubernetes versions, and image prerequisites. Identify any SDK or service prerequisite.
+3. **Who owns the setting?** Identify cluster, AgentPool, NodeClass, NodePool, and operator
+   inputs. State precedence and behavior when inputs conflict, including NAP versus
+   self-hosted configuration.
+4. **What do omission and explicit values mean?** Establish AKS AgentPool defaults and
+   the behavior of each request layer. Match AKS where possible; justify any intentional
+   difference without changing existing-user behavior accidentally.
+5. **How does the setting change over time?** State Azure mutability, desired-configuration
+   mutability, replacement/in-place behavior, and whether external state can change the
+   effective result without a spec edit.
+6. **What does failure look like?** Define unsupported combinations, readiness failures,
+   exhausted candidate sets, downstream rejection, retries, and cleanup.
+7. **What are the costs and recovery limits?** Include pricing, provisioning latency,
+   API calls, permissions, disruption, and how enablement can be stopped or reversed.
 
----
+### Copyable compatibility and defaults matrix
 
-## Step 0: Decide the surface
+Replace the placeholders with feature-specific values. Split rows wherever behavior
+differs; use additional columns for network mode, capacity type, or other relevant inputs.
+For enum/configuration features, replace `false` and `true` with their actual values.
 
-[`0015-nodeclass-vs-labels.md`](./0015-nodeclass-vs-labels.md) is the authority:
+| Input | Deployment / mode | Architecture / image / Kubernetes version | Region / placement / SKU prerequisites | Effective behavior and request value | Unsupported behavior | Evidence |
+|---|---|---|---|---|---|---|
+| Omitted, including existing manifests | Fill in | Fill in | Fill in | State default and omitted vs explicit SDK values | State result | Link source/test |
+| Explicit `false` | Fill in | Fill in | Fill in | State result | State result | Link source/test |
+| Explicit `true` | Fill in | Fill in | Fill in | State result | State result | Link source/test |
+| Invalid or conflicting configuration | Fill in | Fill in | Fill in | State what is rejected and where | Condition/error and remediation | Link source/test |
 
-> If it is a scheduling decision, **and it is something that can be on by default or
-> represented as a simple capability**, make it a well-known label.
->
-> If it is a feature, especially a complex feature with many possible values or related
-> settings, make it an `AKSNodeClass` field.
+Record each mode and deployment model as **supported**, **unsupported**, or **not yet
+verified**. These are not interchangeable. An untested path is not a supported path
+merely because it shares a helper. For temporary platform gaps, link a tracking issue.
 
-The emphasized clause matters. Ultra SSD **affects pricing**, so it cannot be enabled by
-default just because an offering supports it. As the author put it in review:
+> **Never advertise a capability that the provider cannot honor.** A limited initial
+> implementation can be reasonable when its scope is agreed and documented, but explicit
+> unsupported requests must not silently succeed without enabling the requested feature.
 
-> *"the label on the offering means 'this offering supports Ultra SSD' whereas on the
-> nodeclaim it means 'this nodeclaim wants nodes with it enabled'."*
+**Exit:** reviewers can understand defaults, scope, lifecycle, and known gaps without
+reverse-engineering the proposed implementation.
 
-That ambiguity is why `0015` **discourages** exposing both surfaces — only `os-sku` and
-`fips_enabled` do so today.
+## 2. Choose the user-facing surface
 
-`0015` also frames the NodeClass axis as **validation complexity**, not field count.
+[Labels vs. AKSNodeClass](./0015-nodeclass-vs-labels.md) is the authority on this decision.
 
-Note that #1704 **started as an AKSNodeClass field and became a label during review**,
-with #1775 kept as a NodeClass implementation for comparison. Expect to prototype both if
-the call is close.
+| User question | Likely surface | Implementation route |
+|---|---|---|
+| "Which nodes can run my workload?" | A well-known scheduling label for a simple capability or placement property. | Scheduling-label route in section 4, then applicable provisioning/lifecycle work. |
+| "How should Azure configure this node?" | An AKSNodeClass field, particularly for structured settings or complex validation. | NodeClass route in section 3, then applicable scheduling and provisioning work. |
+| "Configure a feature, and schedule against the resulting property." | Consider both only when a single surface cannot model the requirement cleanly. | NodeClass remains authoritative; any label expresses the derived property, not an independent configuration switch. |
+| "How should the controller operate globally?" | An operator option if there is no meaningful per-NodeClass setting. | Options, deployment configuration, defaults, and mode/model coverage. |
 
-`0015`'s closing note is the tiebreaker: **mimic how the capability works in AKS.**
+AKS behavior is a useful precedent, not an absolute requirement: explain deviations
+needed for Karpenter scheduling semantics or provider constraints. If the choice is
+unclear, ask for design feedback before building both APIs.
 
----
+**Applicability:** every feature needs a contract, validation strategy, lifecycle
+decision, tests, and rollout plan. Only NodeClass features need new spec fields; only
+schedulable capabilities need well-known-label registration; only externally resolved
+features need status resolution; only mutable resources need in-place patchers.
 
-## Step 1: API definition — `pkg/apis/v1beta1/aksnodeclass.go`
+## 3. Define defaults and validation
 
-Add to **`v1beta1` only**. `v1alpha2` is deprecated; do not add parity fields there.
+### NodeClass route
 
-* **Pointer + `+optional`** on every new field.
-* **Group by domain, not by feature.** From #1704: *"I wonder if we want a `Disk` or
-  `Storage` section here, so we can group storage-related capabilities in the same way we
-  do for GPU/Linux/etc, rather than `UltraSSD` which is too narrowly scoped to ever get new
-  fields."* Prefer `storage.enableUltraSSD` over a top-level `ultraSSD` struct.
-* **Named string type + `+kubebuilder:validation:Enum` on the type**, with a `const` block
-  documenting each value (`GPUMode`, `LocalDNSMode`).
-* **Nil-safe accessors** on `*AKSNodeClass`, below `Hash()`. All provisioning code calls
-  the accessor, never the raw pointer chain.
-* **Two accessors when effective value ≠ user intent.** `IsArtifactStreamingEnabled(arch)`
-  (architecture-aware, provisioning) vs `IsArtifactStreamingExplicitlyEnabled()`
-  (architecture-independent, instance-type filtering + cache key). Collapsing them makes
-  the cache key wrong.
+Add new functionality to
+[`pkg/apis/v1beta1/aksnodeclass.go`](../pkg/apis/v1beta1/aksnodeclass.go).
+`v1alpha2` is deprecated; do not add fields there solely for parity.
 
-### Defaults: match the AKS AgentPool API
+* Make the new top-level setting optional so existing manifests remain valid. Use pointers
+  and `+optional` where omission must be distinguishable from a zero value. Decide
+  deliberately which nested fields are required when the parent is present.
+* Group related settings by domain and reuse existing structures where appropriate.
+  Avoid an unrelated API redesign.
+* For enums, use a named string type, constants documenting values, and kubebuilder enum
+  validation. Document units, ranges, defaults, constraints, and update behavior.
+* Centralize effective-value logic in accessors that safely handle omitted parent/child
+  settings. Avoid duplicated pointer chains and conflicting defaults at call sites.
+* Keep **user intent** distinct from **per-node effective value** when they differ.
+  Artifact streaming has an architecture-independent explicit-enable accessor for
+  filtering and an architecture-aware accessor for provisioning. Test both contracts.
 
-The default behavior for any added feature in Karpenter should, where possible, match the defaults in the AKS Agentpool API.
-Also for Azure features, the Karpenter path should expose similar control to the AKS Agentpool API. 
+Defaulting must agree across the schema, Go accessors, design, user documentation,
+Azure payload, and tests. An omitted SDK pointer may cause service-side defaulting;
+it is not necessarily equivalent to an explicit `false`.
 
-> **Worked failure — artifact streaming changed its default three times in two weeks.**
->
-> | PR | Merged | Signature | Default |
-> |---|---|---|---|
-> | #1397 | Mar 19 | `IsEnabled(arch)` | `true` for all AMD64 |
-> | #1600 | Mar 31 | `IsEnabled(arch, imageFamily)` + new `osSKUToImageFamily()` | Ubuntu `true`, AzureLinux `false` |
-> | #1611 | Apr 2 | `IsEnabled(arch)` — helper **deleted** | `false` for all |
->
-> #1397's description said the feature was "disabled by default with Karpenter (NAP)"
-> while its code said `return true`. #1600 added a 10-line OSSKU→image-family mapper to
-> `provisionclientbootstrap.go`; #1611 deleted it two days later on discovering the
-> AgentPool API is simply opt-in. Each step churned the CRD text, the Go doc comment, the
-> bootstrap call site, the unit table, the labels test, and the E2E case title.
->
-> **Look up the AgentPool default before writing the accessor.** Put the full matrix —
-> field value × architecture × image family → effective result — in the PR description,
-> and check the description agrees with the diff.
+### Choose the enforcement layer
 
-Final shape, for reference:
+| Layer | Use for | Expected user-visible outcome |
+|---|---|---|
+| CRD schema and CEL | Object-local types, bounds, enums, and cross-field consistency. | Kubernetes rejects the invalid create/update with an actionable message. |
+| Status reconciliation | External dependencies, permissions, and resolved cluster state. | Conditions explain readiness; unresolved required dependencies block provisioning. |
+| Instance-type/offering requirements and filters | Architecture, SKU, zone, and workload/NodePool compatibility. | Only valid capacity is eligible; infeasibility is diagnosable. |
+| Azure request/error handling | Service-side failures that cannot be prevented locally. | Classified provisioning failure, appropriate retry behavior, and cleanup. |
 
-```go
-func (a *ArtifactStreaming) IsEnabled(arch string) bool {
-    if arch == karpv1.ArchitectureArm64 { return false }
-    return a != nil && a.Enabled != nil && *a.Enabled
-}
+For runtime validation, inspect the existing
+[status ValidationReconciler](../pkg/controllers/nodeclass/status/validation.go).
+It already checks Disk Encryption Set permissions; it is not an API admission webhook
+or an empty skeleton. Wire additional checks and conditions into the appropriate
+controller rather than merely adding an unused validation function.
+
+### CRD and CEL checks
+
+* Put item rules on the item, collection rules on the collection, and cross-field rules
+  at a common parent. Ensure omitted optional fields do not cause evaluation errors.
+* Use `listType=map` and map keys for keyed-list uniqueness rather than duplicating that
+  rule in CEL. Set meaningful size bounds such as `maxItems` to constrain input and cost.
+* CEL cannot query a NodePool, Azure SKU, or live cluster resource. Keep those checks
+  in scheduling or reconciliation as appropriate.
+* Test both create and update behavior, including existing stored objects. Tightening
+  validation can break updates to configurations that older versions accepted.
+* Exercise installation of the generated CRD in the API test environment. Lint/codegen
+  alone does not prove that the API server accepts the schema and CEL cost.
+
+**Exit:** valid values are accepted, invalid values fail at the intended layer, and
+omitted settings preserve the agreed behavior.
+
+## 4. Implement scheduling and cache correctness
+
+### NodeClass-dependent filtering
+
+If a setting changes instance-type construction, add the relevant input to
+`instanceTypeParameters` in
+[instancetypes.go](../pkg/providers/instancetype/instancetypes.go) and populate it in
+`List()`. This struct is hashed for the instance-type cache key. Test alternating
+NodeClasses with different settings, including a cache hit, so results cannot leak
+between configurations.
+
+Reuse `isInstanceTypeSupportedByFilters` for SKU-level constraints. When the feature is
+requested, exclude SKUs whose capability is false, absent, or otherwise insufficient.
+When it is not requested, do not narrow capacity because of that feature.
+Handle malformed capability values deliberately; do not turn an unexpected data error
+into a success-shaped default.
+
+Apply zone-dependent constraints when constructing **offerings**, not by globally
+discarding a SKU that works in another zone. Cover regional placement explicitly.
+Check whether the feature also changes allocatable resources, pricing, or image choice.
+
+### Scheduling-label route
+
+A label emitted onto a node is not automatically supported by scheduling simulation.
+Trace the full route:
+
+1. Define the scheduling key in
+   [v1beta1/labels.go](../pkg/apis/v1beta1/labels.go) and register it in
+   `AzureWellKnownLabels`. For a genuinely stable, finite value domain, follow existing
+   `WellKnownValuesForRequirements` registration. Do not enumerate a dynamic SKU domain
+   as if it were fixed.
+2. Populate `computeRequirements` in
+   [instancetype.go](../pkg/providers/instancetype/instancetype.go). For zonal
+   capabilities, also populate offering requirements in `instancetypes.go` and ensure
+   the instance-type requirements accurately represent available offerings.
+3. If a selected label value configures Azure, carry that selection from the NodeClaim
+   requirements into both applicable provisioning families. Do not confuse "supports
+   enabling" with "will be enabled", or enable a paid capability merely because a SKU
+   supports it.
+4. Check requirement-to-label projection in
+   [cloudprovider.go](../pkg/cloudprovider/cloudprovider.go) and
+   `GetWellKnownSingleValuedRequirementLabels` in
+   [providers/labels.go](../pkg/providers/labels/labels.go). The observed node label must
+   match the selected behavior; test reconstruction through Get/List when applicable.
+5. Test Pod selectors/affinity and NodePool requirements through the existing scheduling
+   acceptance suite. Include matching and conflicting requests, unsupported values,
+   absent capability data, and a case with no feasible offering.
+
+Labels in `pkg/providers/labels/labels.go`, such as LocalDNS and artifact-streaming
+state labels, are intentionally separate from well-known scheduling labels. Adding a
+key there alone does **not** make it schedulable. Match AKS label-presence conventions:
+an absent label and a label with value `"false"` have different selector semantics.
+
+### Cache and failure diagnostics
+
+Document all cached inputs, invalidation triggers, and expected convergence time.
+A cache key must distinguish inputs that produce different cached output; external
+source changes also need invalidation or a bounded refresh.
+
+Follow [the machine-cache design](./0011-machine-cache.md) when adding Azure reads:
+cache suitability differs between drift/pre-create checks and authoritative
+post-create, in-place-update, and CloudProvider.Get operations.
+
+If filtering can empty the candidate set, record the failure in the table in
+[the diagnostic design](./0012-quota-fungibility-reactivity-improvements.md) and explain
+what users should inspect. Add appropriate Azure error classification to the existing
+create/error-handling path; only mark offerings unavailable for errors that actually
+indicate an offering problem, not for bad feature configuration or missing permissions.
+
+**Exit:** scheduling predicts what can be created, labels describe what was created,
+and cache reuse does not change either answer.
+
+## 5. Resolve external state and readiness
+
+Use this section only if the effective configuration depends on cluster state or another
+external input. [The LocalDNS reconciler](../pkg/controllers/nodeclass/status/localdns.go)
+is an example, not a requirement to copy its API or sticky behavior.
+
+* Define the source of truth and a single owner for resolved status. Wire the reconciler
+  through the [status controller](../pkg/controllers/nodeclass/status/controller.go)
+  and include the relevant condition in aggregate readiness.
+* Ensure provisioning cannot consume unresolved or stale-required state as though it
+  were a successful resolution. Read the resolved decision consistently in filtering,
+  payload construction, and labels.
+* Define a transition table: unresolved, enabled, disabled, dependency error, spec
+  change, external-input change, and controller restart. Decide explicitly whether
+  resolution is reversible or sticky and whether persistent status is needed.
+* Observe external changes through reliable watches or a bounded periodic requeue.
+  Include upstream cache freshness and retries in the convergence estimate. Do not copy
+  LocalDNS's polling interval without considering your inputs.
+* Distinguish an optional API being absent from a permission failure or transient error.
+  For dynamic-client probes, test both `IsNotFound` and `meta.IsNoMatchError` as applicable.
+  Do not silently disable the feature on an unexpected error.
+* Update Kubernetes RBAC in
+  [clusterrole-core.yaml](../charts/karpenter/templates/clusterrole-core.yaml) and any
+  other applicable role. Separately document Azure permissions and which identity
+  needs them for NAP and self-hosted installations. Request the least privilege needed.
+* Translate a resolved decision at the wire boundary if sending the original "automatic"
+  mode would let the service resolve it differently. `ResolvedLocalDNSForWire()` is
+  an example of this translation.
+
+Keep feature-local constants near the reconciler and genuinely shared values in
+`pkg/consts`. If checks mirror platform validation, link the public contract and explain
+how divergence will be detected. Do not depend on private implementation references.
+
+**Exit:** external changes and errors produce tested, observable transitions with an
+explained convergence bound.
+
+## 6. Wire provisioning and resource lifecycle
+
+Trace the selected value to the actual SDK request and the running node. Use the
+compatibility matrix to decide which paths need changes. Follow `ATTENTION!!!` comments
+that identify counterpart implementations.
+
+### VM-based paths
+
+Start in [vminstance.go](../pkg/providers/instance/vminstance.go).
+Allocate nested SDK profiles only when needed and modify only your fields. Replacing a
+whole `SecurityProfile`, for example, can clobber another feature's settings.
+Test the complete relevant payload, including preservation of sibling fields.
+
+For settings delivered through bootstrap, trace:
+
+`AKSNodeClass / selected requirements -> image-family resolver -> bootstrap values -> node`
+
+Inspect [imagefamily/resolver.go](../pkg/providers/imagefamily/resolver.go) and
+[customscriptsbootstrap](../pkg/providers/imagefamily/customscriptsbootstrap/).
+`CustomScriptsNodeBootstrapping` is implemented per image family: a signature change
+affects the interface, each implementation, resolver calls, and tests. Positional
+arguments can compile while carrying the wrong meaning.
+
+Thread service-delivered values through `ProvisionClientBootstrap` and
+`ConstructProvisionValues` where applicable. Verify differences in units and names
+between kubelet, AKS APIs, and provider fields. If an image family cannot implement the
+setting, enforce and document that restriction rather than relying on an ignored argument.
+
+### AKS Machine API paths
+
+Start in
+[aksmachineinstancehelpers.go](../pkg/providers/instance/aksmachineinstancehelpers.go).
+Configure the appropriate `Machine*Profile` through existing helper patterns. Check
+template placeholders as well as helper definitions: an uncalled helper changes nothing.
+
+Document pointer semantics per property. `nil` can mean not applicable, omit, or inherit
+a service default; explicit `false` can communicate a decision already made by Karpenter.
+Assert on the SDK request, not just an intermediate provider struct. Test enum casts,
+duration units and bounds, list-to-map conversions, and preservation of sibling fields.
+
+For header batching, inspect
+[aksmachinesheaderbatch](../pkg/providers/azclient/aksmachinesheaderbatch/).
+A shared template cannot contain a value that varies between machines in that batch.
+Use supported per-machine header fields or adjust grouping so incompatible requests
+cannot share a template. Test heterogeneous requests and partial failures; do not assume
+every new SDK property has a corresponding header representation.
+
+### All applicable paths
+
+Construct new clients through [azclient](../pkg/providers/azclient/) and wire only the
+modes that need them. Cover cancellation, long-running operations, throttling, eventual
+consistency, and retry classification using existing client patterns.
+
+For every created Azure resource, identify its owner, cleanup path, and behavior after
+partial creation or a lost response. Retries must not leak duplicate resources.
+Deletion and garbage collection must tolerate resources already being gone.
+
+**Exit:** each supported path sends the intended request, produces the intended node
+behavior, and remains safe to retry or delete after partial failure.
+
+## 7. Prove upgrade, drift, and update behavior
+
+Azure resource immutability and NodeClass API immutability are different decisions.
+An Azure create-only property may still be editable in desired configuration, with new
+nodes receiving the change through replacement. Document what happens to existing nodes,
+and consider disruption budgets and workloads before claiming immediate convergence.
+
+### Replacement and hashing
+
+Read `Hash()` and the `AKSNodeClassHashVersion` guidance in
+[aksnodeclass.go](../pkg/apis/v1beta1/aksnodeclass.go), plus
+[drift.go](../pkg/cloudprovider/drift.go). Review a hash-version change when an existing
+hashed field's default changes, an already-populated field enters the hash, or a field
+leaves it. A new nil optional field may preserve the hash under the existing hash options;
+prove that with tests rather than bumping the version automatically.
+
+Extend both relevant tables in
+[aksnodeclass_hash_test.go](../pkg/apis/v1beta1/aksnodeclass_hash_test.go), including
+literal-hash expectations and intended hash changes. Test omission and explicit zero
+values. Do not update golden hashes merely to make unexplained failures disappear.
+
+The spec hash alone does not cover every effective behavior change. If resolved status,
+images, bootstrap data, or operator configuration changes, identify and test the actual
+drift mechanism in each supported provisioning family. A hash-version bump is not itself
+a promise that nodes will be immediately replaced.
+
+### In-place changes
+
+Only exclude a setting from replacement hashing with an explicit reason and a complete
+reconciliation path. For a mutable Azure property, inspect
+[inplaceupdate](../pkg/controllers/nodeclaim/inplaceupdate/):
+
+* Extend `vmInPlaceUpdateFields` and/or `aksMachineInPlaceUpdateFields` in `utils.go`,
+  including the code populating them. Their contents differ intentionally.
+* Extend `vmPatchers` and/or `aksMachinePatchers` in `patch.go`. Preserve unrelated fields
+  and confirm whether omitting a property preserves or clears its existing value.
+* Extend the watch predicate in `predicates.go`; a tag-only predicate will not observe
+  an unrelated setting change.
+* Test successful update, no-op reconciliation, retry, and controller restart.
+  An E2E update should retain the NodeClaim/resource identity and avoid unintended drift.
+* Consider a one-time increase in reconciliation/API traffic if existing in-place hashes
+  change. Ensure patch logs cannot expose sensitive values.
+
+### Upgrade contract
+
+Test an existing manifest that omits the feature, an explicitly configured object, and
+the new transition behavior. State any old-controller/new-CRD or rollback constraints
+that require ordered deployment. Do not assume an older controller understands a new
+field, label, or enum value.
+
+**Exit:** reviewers know whether each change affects new nodes, existing nodes in place,
+or replacement, and existing users retain the documented behavior.
+
+## 8. Build the evidence and run checks
+
+### Test plan
+
+Extend the established sibling test or package suite and reuse its fakes, setup,
+assertions, and table style. Start acceptance tests from pending Pod pressure where
+possible. Avoid a disconnected suite that only exercises your new helper.
+
+| Area | Evidence to add where applicable |
+|---|---|
+| API/accessors: `pkg/apis/v1beta1/*_test.go` | Omitted parents/children, explicit zero/false, enabled values, defaults, and unsupported combinations. |
+| API admission: `crd_validation_cel_test.go` | Generated CRD installation; valid/invalid create and update cases; legacy-object compatibility. |
+| Scheduling: `pkg/providers/instancetype/` and existing acceptance suites | Capable/incapable/missing-capability SKUs; labels and requirements; zone/regional differences; no feasible offering; cache-hit isolation. |
+| Resolution: `pkg/controllers/nodeclass/status/` | External-input transitions, dependency errors, permissions, restart, readiness, and convergence. |
+| Payloads: `pkg/providers/instance/` and `pkg/cloudprovider/` | VM and Machine SDK requests, nil/false semantics, sibling preservation, conversions, and heterogeneous batches. |
+| Lifecycle: existing drift/in-place-update/GC suites | Enable/disable transitions, no unintended replacement, partial create/update failure, retry, and already-deleted resources. |
+| E2E: `test/suites/<existing suite>/` | Real node behavior and Azure lifecycle, not only request acceptance or controller labels. |
+
+For deterministic SKU coverage, include supporting and non-supporting data plus absent
+capabilities. Follow existing test fakes. If changing generated SKU fixtures, use the
+`codegen-skugen` target and generator flow in [Makefile](../Makefile); do not hand-edit
+`pkg/fake/zz_generated.sku.*.go`. Review regenerated data for unrelated changes.
+
+### Local checks
+
+Use the development environment in [CONTRIBUTING.md](../CONTRIBUTING.md) and the
+toolchain/dependencies declared by this checkout. From the repository root:
+
+```bash
+# Focus unit/acceptance behavior during development; replace the test-name expression.
+FOCUS='YourFeature' make test
+
+# Before submitting code: generation, validation, lint, and unit/acceptance tests.
+make presubmit
 ```
 
-### Kill switch
+`make verify` performs generation and static checks; it does **not** run the test suite.
+`make test` runs tests under `pkg/`; the E2E module under `test/` is separate. A focus
+expression that matches no tests is not evidence that the feature works: confirm the
+intended cases ran. If required tools or the API test environment are missing, use
+`make toolchain` as described in the contribution instructions.
 
-Ship one. Pick deliberately:
+Do not hand-edit deepcopy files, generated CRDs, or chart CRD copies. Run `make verify`,
+inspect and include generated changes, and rerun after corrections. For documentation-only
+changes, review links/examples and follow any applicable documentation checks; Azure E2E
+is not required merely because this guide describes it.
 
-| Idiom | Example | Use when |
-|---|---|---|
-| Default-off optional field | `artifactStreaming.enabled` | User-facing toggle |
-| Version threshold constant | `localDNSPreferredK8sVersionThreshold` | Gradual rollout; raise to disable |
-| Operator option | `--enable-node-hardening` (#1818) | Behavior change with no per-NodeClass meaning |
+### Real-Azure evidence and external contributors
 
-A change that can only be undone by a revert will get pushback.
+Use a dedicated disposable test cluster/subscription scope that you are authorized to
+operate. Provisioning and E2E tests create, modify, and delete resources and incur costs.
+Confirm the cluster context, credentials, permissions, regional quota, and feature
+registrations before running them. Never use a production or shared workload cluster.
+Do not paste credentials or customer identifiers into test evidence.
 
-### Hash and drift
+After following the environment setup, a focused run can use:
 
-`AKSNodeClassHashVersion` is currently `"v3"`. Bump **only** when you change a default on
-an already-hashed field, add a field with an already-set value to the hash, or remove one.
-A new optional nil field under `IgnoreZeroValue: true` does **not** require a bump.
-Getting this wrong replaces every node in every existing cluster.
-
-`hash:"ignore"` is only for fields updatable in place (see `Tags`) — those go through
-Step 3b.
-
-Add entries to **both** tables in `aksnodeclass_hash_test.go`: the static-hash table (with
-the literal expected hash) and the "should change hash" table.
-
-### CEL validation
-
-Its own review pass. #1301 exists purely to restore validation dropped from #1233.
-
-* **`listType=map` enforces key uniqueness — do not write a CEL uniqueness rule.**
-  Confirmed in the merged CRD: `localDNS.{kube,vnet}DNSOverrides` carry
-  `x-kubernetes-list-type: map` with `x-kubernetes-list-map-keys: [zone]` and **no**
-  uniqueness rule.
-* **Place rules at the right level.** Intra-item rules go on the item
-  (`LocalDNSZoneOverride`: `'cluster.local' cannot be forwarded to VnetDNS`); cross-item
-  rules go on the array (`must contain required zones '.' and 'cluster.local'`);
-  cross-field rules go on the spec (FIPS × imageFamily × trustedLaunch).
-* **Keep a sensible `maxItems`.** LocalDNS uses `maxItems: 100`. It was originally required
-  to bound a CEL uniqueness check; the check was dropped once `listType=map` was
-  understood, but the limit was kept deliberately.
-* **Adding CEL rules breaks existing fixtures** that were never valid. Expect churn.
-* Per the #1301 discussion, CEL cost-budget failures surface at **CRD deployment**, not at
-  `make verify` — so the signal arrives late in CI. Worth knowing when a large rule set
-  passes locally.
-* `pkg/apis/.../validation.go` is a deliberate skeleton for what CEL cannot express. Use it
-  rather than inventing a location.
-* **CEL only sees `self`.** It cannot reference NodePool. If validity depends on
-  architecture, zone, or NodePool requirements you need a filter (Step 2), not validation.
-  `ArtifactStreaming.IsEnabled`'s doc comment records this precedent explicitly.
-
----
-
-## Step 2: Instance type and offering filtering
-
-If the feature restricts which SKUs or zones are usable, wire it into
-`pkg/providers/instancetype/instancetypes.go`:
-
-1. **Add the field to `instanceTypeParameters`.** This struct is the instance-type cache
-   key. Omitting it serves stale, wrongly-filtered instance types to a different NodeClass.
-   Most commonly missed step.
-2. Populate it in `List()` from the accessor.
-3. Add `isInstanceTypeSupportedBy<Feature>` and chain it into
-   `isInstanceTypeSupportedByFilters`.
-
-```go
-func (p *DefaultProvider) isInstanceTypeSupportedByFeature(sku *skewer.SKU, params *instanceTypeParameters) bool {
-    if !params.FeatureEnabled { return true }        // never narrow when disabled
-    value, err := sku.GetCapabilityString("FeatureSupported")
-    if err != nil { return false }                   // absent capability == unsupported
-    return strings.EqualFold(value, "True")
-}
+```bash
+# Example only: select the existing suite, feature expression, and supported mode.
+TEST_SUITE=Storage FOCUS='YourFeature' PROVISION_MODE=aksmachineapi make e2etests
 ```
 
-Fail **closed** (exclude) when the feature is requested; fail **open** when it is not.
+This command does not create/configure the test environment for you. Inspect prerequisites
+and cleanup behavior in [Makefile](../Makefile), [Makefile-az.mk](../Makefile-az.mk), and
+the [workflow instructions](../.github/workflows/README.md). Do not invoke broad cleanup
+targets without understanding their scope.
 
-* **Zonal variance needs evidence.** From #1704: *"Do we have examples where ultrassd is
-  enabled in some zones but not others?"* Show the empirical case, not just that skewer
-  exposes the API. Ultra SSD uses `sku.IsUltraSSDAvailableInAvailabilityZone(zone)` per
-  zone, matching RP logic.
-* A filter that can empty the candidate set surfaces as
-  `no instance type has the required offering` with no mention of your feature. Add your
-  filter to the table in [`0012`](./0012-quota-fungibility-reactivity-improvements.md).
-* New failure modes need classification in `beginCreateErrorHandling` / the
-  unavailable-offerings cache, or they degrade to generic `CreateInstanceFailed`.
-* Update `pkg/fake/zz_generated.sku.*.go` so both a supporting and a non-supporting SKU
-  exist in the test region.
+For maintainer-operated CI, the workflow instructions describe branch identity
+permissions and manual E2E triggering. Fork contributors generally cannot assume access
+to upstream credentials or runners. If you cannot run a required case, include local
+results, the exact missing coverage, and a request for maintainer-assisted testing.
+Maintainers decide what evidence is sufficient before merging.
 
----
+Record the commit tested, command/workflow link, deployment model, mode, region,
+placement, Kubernetes version, architecture/image, assertions, and result. Keep
+**passed**, **failed**, **skipped**, and **not run** distinct. Link separate zonal and
+regional runs for zone-sensitive behavior. A skip for an unsupported mode is useful,
+but is not a passing behavioral test.
 
-## Step 3: Status resolution (only if the value must be resolved)
+Reuse an existing E2E suite. A new directory under `test/suites/` must also enter
+[e2e-matrix.yaml](../.github/workflows/e2e-matrix.yaml). Verify on-node effects through
+the relevant service, process, runtime configuration, or workload; a label alone does
+not prove enablement. Helm snapshots prove rendering, not runtime behavior.
 
-If the effective value depends on cluster state, do not resolve it at provisioning time.
-Follow `pkg/controllers/nodeclass/status/localdns.go`.
+**Exit:** every supported behavior has appropriate evidence, and limitations are visible.
+Ask: **would these tests fail if the feature were wired to the wrong mode or did nothing?**
 
-* `spec.<feature>.mode` accepts `Preferred | Required | Disabled`.
-* A sub-reconciler under `pkg/controllers/nodeclass/status/` is the **sole writer** of
-  `status.<feature>State` and contributes a `<Feature>Ready` condition folded into the
-  aggregate `Ready`.
-* Provisioning reads **status**, never spec. `IsLocalDNSEnabled()` is a pure pointer read,
-  making the per-SKU filter loop free.
-* If downstream rejects the tri-state, translate at the wire boundary.
-  `ResolvedLocalDNSForWire()` maps `Preferred` → `Required`/`Disabled` so the RP can never
-  re-resolve to a different answer than the source of truth.
+## 9. Plan rollout and recovery
 
-### Verified behaviors to copy
+Distinguish these controls; do not call all of them a "kill switch":
 
-* **Sticky is asymmetric.** Enabled is sticky under `Preferred`; Disabled is not. Users opt
-  out only by changing Mode.
-* **Errors requeue; they do not fail safe.** `meetsClusterRequirements` propagates every
-  error; `reconcilePreferred` sets `Ready=False` and returns it; controller-runtime backs
-  off. There is **no `IsForbidden` special case** in the merged code — a review thread
-  discussed adding one, but it is not there. Do not add one without discussion.
-* **Periodic requeue is mandatory.** `localDNSPreferredRequeueAfter = 5 * time.Minute`,
-  because cluster gate inputs (NetworkPolicies, upstream DaemonSets) mutate out-of-band
-  without producing an AKSNodeClass event. Without it, your feature never re-resolves.
-* **No watermark fields.** An earlier iteration stored `ObservedGeneration` /
-  `ObservedKubernetesVersion` / `ResolveFailures`; review removed them (*"Can we just do
-  this locally in-memory rather than storing it here?"*). Sticky reads
-  `Status.LocalDNSState` itself; retry state lives in controller-runtime backoff.
-* **Unknown enum value clears state and logs at Error**, with a comment noting CRD enum
-  validation should make the branch unreachable.
-* **Dynamic-client CRD probes check both `IsNotFound` and `meta.IsNoMatchError`** — the
-  latter is what you actually get for an unregistered CRD.
-* **Defend non-obvious optimizations in a code comment.** The `Limit: 2` NetworkPolicy list
-  carries its correctness argument inline, because a reviewer challenged it (and the
-  challenge turned out to be wrong).
-
-### Constants and cache
-
-* **Feature-local constants live next to the reconciler**, unexported.
-  `localDNSPreferredK8sVersionThreshold` is a `const` in `localdns.go`, not in
-  `pkg/consts`. `pkg/consts/consts.go` holds only cross-cutting values: network
-  plugin/mode/dataplane/policy, provision modes, storage profiles, maxPods defaults, batch
-  size, compute-recommendation modes, provisioning states.
-* **Cache TTL determines convergence.** `KubernetesVersionTTL = 15 * time.Minute`
-  (`pkg/cache/cache.go`). A control-plane upgrade takes up to that long to flip a
-  version-gated state; nodes created in the stale window need drift to converge. State the
-  observable latency in your PR.
-* **Keep threshold constants and their doc comments in sync.** The LocalDNS threshold is
-  currently `"1.99.0"` while the surrounding `LocalDNSReconciler` comment still says
-  `k8s>=1.36`. Do not replicate this.
-
-### RBAC
-
-Cluster-state gates almost always need new permissions. LocalDNS needed `list` on
-`networking.k8s.io/networkpolicies`, `cilium.io/cilium{,clusterwide}networkpolicies`, and
-`crd.projectcalico.org/{network,globalnetwork}policies` (best-effort), `get` on
-`apps/daemonsets`, and `patch` on `aksnodeclasses/status`. Update
-`charts/karpenter/templates/clusterrole-core.yaml`.
-
-### Two-place sync
-
-If your gate logic mirrors an RP validator, say so in a code comment. It will drift.
-
----
-
-## Step 3b: Day-2 / mutable features
-
-* Mark the field `hash:"ignore"` in the spec.
-* Add it to `vmInPlaceUpdateFields` and/or `aksMachineInPlaceUpdateFields`
-  (`inplaceupdate/utils.go`). They are **not symmetric** — VM identities are handled
-  server-side for AKS machines and are deliberately absent from the machine struct.
-* Add a patcher to `vmPatchers` / `aksMachinePatchers`.
-* **Extend the watch predicate.** `tagsChangedPredicate` only fires on tag changes; your
-  field will not trigger reconcile without it.
-* Changing the in-place hash struct changes the annotation on existing NodeClaims — a
-  one-time patch storm. Budget for it.
-* Prove it with an E2E that applies the change **without drifting the NodeClaim**
-  (`test/suites/inplaceupdate/`).
-
----
-
-## Step 4: VM-based path
-
-`pkg/providers/instance/vminstance.go`. Follow the nil-guard-then-set style of
-`setVMPropertiesSecurityProfile` / `setVMPropertiesAdditionalCapabilities`: allocate the
-sub-profile only if nil, touch only your field. Overwriting a whole `SecurityProfile`
-clobbers a concurrently-set sibling — note that the existing code checks
-`if vmProperties.SecurityProfile.SecurityType == nil` before setting, precisely so
-Trusted Launch does not stomp a value set by another path.
-
-Some features are absent here by design: Ultra SSD's VM path leaves
-`AdditionalCapabilities.UltraSSDEnabled` unset when disabled, mirroring AKS VMSS behavior
-where the property is nil rather than false.
-
-If the setting is delivered through bootstrap rather than the ARM payload, see Step 6.
-
----
-
-## Step 5: AKS Machine API path
-
-`pkg/providers/instance/aksmachineinstancehelpers.go`. Set the field on the right
-`armcontainerservice.Machine*Profile` (`MachineSecurityProfile`, `MachineKubernetesProfile`,
-`MachineOSProfile`, `LocalDNSProfile`, `GPUProfile`) via a
-`configure<Feature>Profile(nodeClass, instanceType)` helper.
-
-> **Grep the machine template for commented-out fields before you start.** #1607's entire
-> functional diff replaces the literal line `// ArtifactStreamingProfile: nil,` with a real
-> call. #1397 shipped with that placeholder in place and nothing caught it for two weeks.
-
-### nil vs explicit false
-
-Both patterns exist. The discriminator is **who owns the decision**:
-
-* **Return `nil`** when the profile object is not applicable —
-  `configureArtifactStreamingProfile` returns nil when disabled;
-  `configureGPUProfile` returns nil for non-GPU SKUs.
-* **Send explicit `true`/`false`** when Karpenter has already made the decision and used it
-  for instance-type filtering — `MachineSecurityProfile.EnableEncryptionAtHost`,
-  `EnableVTPM`, `EnableSecureBoot` are all `lo.ToPtr(...)` of a resolved bool. From #1704:
-  *"Karpenter wouldn't want to give Machine API an unclear `nil` if Karpenter already
-  assumes that it is `false` through instance filtering."*
-
-Document the defaulting behavior **at each layer** in the design doc — reviewers asked for
-this explicitly.
-
-### Type conversions
-
-Round-trip test anything non-trivial and assert on the SDK payload, not your own struct.
-#1610 needed:
-
-* `[]LocalDNSZoneOverride` (list keyed by `zone`) → `map[string]*LocalDNSOverride`
-* `karpv1.NillableDuration` → **seconds as `int32`**
-* enum values → direct casts between Karpenter and SDK string types
-
-### Batching
-
-`aksmachineapi` and `aksmachineapiheaderbatch` are one path with two create-dispatch
-strategies. Anything derived from `instanceType` (architecture, VM size) is **per-machine**
-and must be a `BatchPutMachine` header entry — a per-machine field on the shared machine
-template is silently applied to every machine in the batch. Artifact streaming is the
-worked example, since `configureArtifactStreamingProfile` reads
-`instanceType.Requirements.Get(v1.LabelArchStable)`.
-
----
-
-## Step 6: Bootstrapping path
-
-Highest blast radius.
-
-* `CustomScriptsNodeBootstrapping(...)` is **duplicated per image family**. Adding a
-  parameter means editing `ubuntu_2004.go`, `ubuntu_2204.go`, `ubuntu_2404.go`,
-  `azlinux.go`, `azlinux3.go`, the `ImageFamily` interface and `Resolve()` in
-  `imagefamily/resolver.go`, plus every `*_test.go` — including positional calls like
-  `CustomScriptsNodeBootstrapping(nil, nil, nil, nil, nil, "test-distro", "Standard_LRS", nil, nil, nil, nil)`
-  where a missing argument is a compile error but a *misordered* one is not.
-* Note the `_ *v1beta1.LocalDNS` blank parameter in `ubuntu_2004.go` — the established way
-  to say "this family does not support the feature."
-* Add the field to `ProvisionClientBootstrap` and thread it through
-  `ConstructProvisionValues`.
-* `provisionclientbootstrap.go` carries an explicit `ATTENTION!!!` that changes there may
-  not take effect on AKS machine nodes. Treat it as a hard requirement to do Step 5 too.
-* **Custom data changes drift nodes.** `ProvisionClientBootstrap.Labels` is tagged
-  `hash:"set"`, which makes label ordering hash-stable.
-* **Kubelet field naming mirrors upstream kubelet, not AKS.** Document the delta in a
-  comment (`containerLogMaxSize` vs AKS `containerLogMaxSizeMB`; `podPidsLimit` int64 vs
-  AKS `PodMaxPids` int32).
-* Cross-field coupling is common — `kubelet.failSwapOn` must be false for
-  `linuxOSConfig.swapFileSize`, enforced by a spec-level CEL rule.
-
-> **Worked failure.** #1039 fixed OSSKU not reaching `GET NodeBootstrapping`, breaking
-> artifact streaming enablement for **AzureLinux only, in `bootstrappingclient` mode only**.
-> That is the exact shape of bug this section exists to prevent — and #1600/#1611 later
-> added and removed an OSSKU→image-family mapper in the same file.
-
----
-
-## Step 7: Labels, generated artifacts, wiring
-
-* Label keys go in `pkg/providers/labels/labels.go` alongside
-  `AKSArtifactStreamingEnabledLabelKey` / `AKSLocalDNSStateLabelKey`, emitted from
-  `labels.Get`.
-* **Match AKS's label-presence convention.** Artifact streaming sets the label only when
-  enabled and omits it otherwise, rather than writing `"false"` — the code comment cites
-  AKS RP behavior. Check what AKS actually does before choosing.
-* **Expect to change shared helper signatures.** #1397 changed
-  `labels.Get(ctx, nodeClass)` → `labels.Get(ctx, nodeClass, arch)`, rippling into
-  `launchtemplate.go` and every labels test. Budget for it; do not work around it.
-* Only assert a label value you control. AKS-set labels must be verified against real node
-  output in E2E, not assumed.
-* Run `make verify`. Never hand-edit `zz_generated.deepcopy.go`, `pkg/apis/crds/*.yaml`, or
-  `charts/karpenter-crd/templates/*`. Note the CRD contains **both** `v1alpha2` and
-  `v1beta1` schemas, so a `v1beta1`-only change still produces two hunks per file across
-  two files.
-* New Azure clients are constructed in `pkg/providers/azclient`; construction is
-  mode-dependent — decide which modes need it.
-* New operator flags go in `pkg/operator/options` **with a safe default**; NAP and
-  self-hosted supply configuration differently.
-
----
-
-## Appendix: category-specific concerns
-
-The steps above are common to all features. These are the extra seams by category.
-
-### Networking
-
-* Configuration has **two sources**:
-  `lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, ..., opts.SubnetID)`. Reading only one
-  breaks either self-hosted or per-NodeClass BYO VNET.
-* Node labels are **conditional on plugin mode** — `opts.IsAzureCNIOverlay()` gates
-  `AKSLabelSubnetName`, `AKSLabelVNetGUID`, `AKSLabelAzureCNIOverlay`,
-  `AKSLabelPodNetworkType`. Extend the existing "Azure CNI node labels and agentbaker
-  network plugin" `DescribeTable` in `instancetype/suite_test.go`; do not add a new one.
-* `maxPods` defaulting is plugin-dependent (30 / 250 / 250 / 110 via `consts`), feeds
-  `instanceTypeParameters`, and therefore the cache key.
-* NICs are a separate lifecycle with a dedicated GC controller
-  (`nodeclaimgarbagecollection.NewNetworkInterface`). AKS Machine mode does not create
-  NICs — a networking change may legitimately be VM-only, but say so.
-* Assert on `NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput`; see the BYO-VNET NSG
-  tests in `instance/suite_test.go`. E2E is near-mandatory — subnet/NSG/route-table
-  behavior is not faithfully faked.
-
-### Security
-
-* Almost always SKU-gated (`EncryptionAtHostSupported`, `sku.IsTrustedLaunchEnabled()`), so
-  the field **must** enter `instanceTypeParameters` and the filter chain.
-* Interlocks with image selection.
-  `imagefamily.GetImageFamily(imageFamily, fipsMode, isTrustedLaunch, k8sVersion, ...)`
-  takes security inputs directly — a new security field that changes the image lineage will
-  **drift every existing node**. Check that first.
-* Three CEL rules already constrain FIPS × imageFamily × trustedLaunch. Adding a fourth
-  interacting field means re-deriving all of them.
-* `logVMPatch` marshals the entire VM patch at V(1). If your field lands there, it gets
-  logged.
-
-### Bootstrapping
-
-See Step 6 — this is the category with the most duplicated call sites and the highest
-drift risk.
-
-### Scheduling / capacity
-
-* Offering-level, not NodeClass-level: availability varies per SKU **and per zone**.
-* `toCreateError` surfaces classified reasons (`SKUNotAvailable`, `ZonalAllocationFailure`)
-  onto the `Launched` condition; unclassified failures degrade to generic
-  `CreateInstanceFailed`.
-* Regional vs zonal zone values must be handled identically in offering construction and
-  node labeling (`zones.MakeAKSLabelZoneFromARMZones`).
-
-### Caching
-
-Per [`0011-machine-cache.md`](./0011-machine-cache.md): cache is acceptable for drift
-detection and pre-create existence checks; **never** for post-create validation, in-place
-update, or `CloudProvider.Get`. If your feature adds a read, state which bucket it is in.
-
----
-
-## Testing
-
-| Level | Location | Cover |
+| Control | What it can do | What it does not establish |
 |---|---|---|
-| Unit | `pkg/apis/v1beta1/*_test.go` | Accessor nil/false/true/unset matrix; hash unchanged for an object that does not set the field |
-| Unit | `pkg/apis/v1beta1/crd_validation_cel_test.go` | Accept omitted / true / false; reject every invalid combination |
-| Unit | `pkg/providers/instancetype/instancetypes_test.go` | Filter no-ops when disabled; excludes non-capable SKUs when enabled; SKU with capability **absent**; cache key changes |
-| Unit | `pkg/providers/instance/*_test.go`, `pkg/cloudprovider/suite_aksmachineapi_features_test.go` | Payload assertions for VM properties **and** the Machine profile |
-| Acceptance | `pkg/` Ginkgo | Start from pending pod pressure; assert NodeClaim/labels |
-| E2E | `test/suites/<existing suite>/` | Real Azure behavior only |
+| Default-off field | Require users to opt in. | An operator-wide override for already-enabled configurations. |
+| Automatic-enablement threshold | Limit eligibility for automatic resolution. | Disabling explicit-required or already-sticky-enabled configurations. A compiled constant also requires a new deployment. |
+| Operator feature gate | Control the behavior defined by that gate. | Automatic remediation of existing nodes, unless implemented and tested. |
+| Configuration change or rollback | Stop future use or deploy an older implementation, subject to compatibility. | Undoing Azure-side state or safely replacing all existing nodes. |
 
-Rules reviewers apply:
+For example, LocalDNS `Preferred` retains an enabled state before rechecking eligibility,
+and `Required` does not use the Preferred version gate. Raising its threshold is not a
+universal disable mechanism. Treat this as a caution about scope, not a recommended
+recovery procedure.
 
-* **Extend the existing sibling `_test.go`**, matching its fakes, `DescribeTable` shape,
-  naming, and assertion style. A parallel new suite next to an existing one gets flagged.
-* **If your PR inverts existing assertions, that is a behavior change.** #1397 flipped
-  `BeFalse()` → `BeTrue()` across `provisionclientbootstrap_test.go` and deleted the
-  arch/OS constraint assertions; #1600 flipped two back; #1611 collapsed the table from
-  ~12 entries to 5. Call assertion inversions out explicitly in the description.
-* **Find the right existing suite.** #1797 moved Ultra SSD tests into the **Storage** suite
-  after the fact. New `test/suites/` directories are a last resort and must be added to
-  `.github/workflows/e2e-matrix.yaml`.
-* **Zone-sensitive features need both zonal and regional E2E runs**, linked separately
-  (#1797 did this).
-* **Verify on the node, not just the API.** The artifact streaming E2E schedules a
-  privileged `hostPID` pod, greps for the `overlaybd-tcmu` process and for `overlaybd` in
-  `/host/etc/containerd/config.toml`, and asserts on the combination. LocalDNS validation
-  checked the node label, `systemctl is-active localdns.service`, and `/etc/resolv.conf`.
-* **Gate E2E on the modes that support the feature.** The artifact streaming suite
-  `Skip`s when `env.InClusterController` is true, because it requires NPS.
-* Failure paths need coverage: filter-empties-everything, RP rejects the field, partial
-  batch failure, deletion when the resource is already gone.
-* Helm chart snapshot diffs prove template rendering only. Never cite them as behavioral
-  evidence.
-* Ask: **would this test fail if the behavior regressed?**
+Document who can operate each control in NAP and self-hosted installations; whether it
+needs a deployment, spec edit, or platform action; how quickly it takes effect; and what
+happens to new, in-flight, and existing nodes. If emergency disablement or reversal is
+not possible, state that explicitly and discuss rollout risk before implementation.
+Test the claimed control rather than assuming a revert is safe.
 
-> E2E suites live under `test/suites/` (the `test/pkg/` tree contains shared E2E environment and helper code).
+Also provide:
 
----
+* Measured provisioning-latency and per-node Azure API-call impact, with baseline and
+  conditions, or a defensible explanation when the path adds neither.
+* Convergence latency accounting for cache freshness, reconciliation, service behavior,
+  and any replacement/disruption constraints.
+* Actionable conditions/events/errors and troubleshooting steps for likely failures,
+  without credentials, tokens, or customer identifiers.
+* Cleanup ownership and a bounded canary plan appropriate to the feature's risk, including
+  success criteria and circumstances that stop expansion.
 
-## Production Readiness
+**Exit:** operators can detect trouble, limit further impact, and understand recovery
+without assuming the provider can undo a create-only Azure setting.
 
-* Kill switch identified and shipped.
-* Measured effect on provisioning latency and per-node Azure API call count stated.
-* Convergence latency stated for anything behind a cached input (e.g. the 15-minute
-  Kubernetes version TTL).
-* Every created Azure resource has a cleanup path including on partial failure; "not found"
-  during delete/GC is success.
-* No credentials, tokens, or customer identifiers in logs, events, conditions, or tags.
-* No references to systems external contributors cannot access — this repository is public
-  and contributions must be reviewable from public sources alone.
+## 10. Prepare the pull request
 
----
+Follow [the repository PR template](../.github/pull-request-template.md), including
+its title conventions, documentation-impact selection, and release-note block.
+Link the issue and feature design, and complete any CLA checks. Explain:
 
-## Pull request expectations
+* The user-visible change, public platform contract, alternatives, and intentional
+  deviations from AKS defaults.
+* The compatibility/defaults matrix, supported modes/models, and unsupported or unverified
+  cases with reasons and tracking issues.
+* The validation, scheduling, request, label, and lifecycle paths changed. Call out any
+  existing assertion you inverted: it is evidence of a behavior change, not routine churn.
+* Commands/results and real workflow or reproducible test evidence for the actual revision.
+  Identify missing access without claiming a waiver from testing.
+* Upgrade, rollout/recovery, pricing, permissions, and documentation implications.
+  Add user examples, supported combinations, and troubleshooting in the relevant public
+  documentation, or link a coordinated documentation issue as the PR template permits.
 
-* Conventional-commit title (`feat:` / `fix:` / `BREAKING CHANGE:`).
-* A filled-in `release-note` block. #1611 is the model: *"Users must explicitly set
-  `artifactStreaming.enabled: true` in AKSNodeClass to enable it."*
-* **Links to actual E2E workflow runs.** #1704, #1797, #1818 link runs; #1676 included a
-  14-row on-node verification matrix.
-* Which provisioning modes and deployment models were exercised, and which were not and why.
-* The default matrix (field × architecture × image family → result), agreeing with the diff.
-* **Verify AI-generated review findings before acting.** On #1676, three bot findings were
-  real and fixed; two were wrong and correctly rejected after the reviewer reasoned through
-  the code. Treat them as hypotheses.
+Keep commits and explanations focused. Use public references; do not require reviewers
+to access private discussions. Check automated review suggestions against source and
+tests before accepting them, and explain evidence-based disagreements.
 
----
+## Ready-for-review checklist
 
-## FAQ
+Use this as a summary in the PR; mark conditional items not applicable with a reason.
 
-### Do I need to bump `AKSNodeClassHashVersion`?
+* [ ] Problem, scope, surface choice, and unresolved design questions are documented.
+* [ ] SDK/service availability, defaults, prerequisites, and public references are recorded.
+* [ ] Compatibility matrix distinguishes supported, unsupported, and unverified cases.
+* [ ] Omitted settings preserve the agreed behavior for existing manifests and nodes.
+* [ ] Validation failures occur at the intended layer with useful diagnostics.
+* [ ] Scheduling requirements, offering filters, cache keys, and observed labels agree.
+* [ ] Every claimed provisioning path is wired through to the SDK payload and node behavior.
+* [ ] External-state readiness, observation, transitions, and permissions are covered.
+* [ ] Replacement/in-place behavior, hash changes, upgrades, and rollback limits are explained.
+* [ ] Retries, partial failures, cancellation, and cleanup have appropriate coverage.
+* [ ] Relevant local checks and E2E results identify the tested revision; gaps are explicit.
+* [ ] Rollout controls, operator ownership, costs, and convergence are documented.
+* [ ] User docs/examples, release note, PR template, and CLA requirements are addressed.
 
-Only if you change a default on an already-hashed field, add a field with an already-set
-value to the hash, or remove one. A new optional nil field does not.
+## Appendix: implementation examples and lessons
 
-### My feature only works on one provisioning mode. Is that acceptable?
+These are reference points, not prescriptions for every feature. Source links resolve
+within your checkout; historical PRs are upstream context. When citing behavior in a
+design, link the specific revision and test that establish it rather than relying on
+a mutable file or an old review comment. Update related references when implementation
+changes; avoid copying version thresholds, hash literals, or TTLs into new designs.
 
-Yes, if stated explicitly with the reason and a tracking issue for a temporary SDK or RP
-gap. Silently no-opping in the other mode is not.
+| Concern | Starting point | Lesson |
+|---|---|---|
+| Defaults and effective values | Artifact-streaming accessors in [aksnodeclass.go](../pkg/apis/v1beta1/aksnodeclass.go); upstream [1397](https://github.com/Azure/karpenter-provider-azure/pull/1397), [1600](https://github.com/Azure/karpenter-provider-azure/pull/1600), [1611](https://github.com/Azure/karpenter-provider-azure/pull/1611). | Confirm platform defaults first; keep description, accessors, payloads, and tests consistent. |
+| Missing Machine API wiring | [Machine helpers](../pkg/providers/instance/aksmachineinstancehelpers.go); upstream [1607](https://github.com/Azure/karpenter-provider-azure/pull/1607). | A bootstrap implementation does not prove Machine API support. |
+| Image/bootstrap parity | [Image-family resolver](../pkg/providers/imagefamily/resolver.go); upstream [1039](https://github.com/Azure/karpenter-provider-azure/pull/1039). | OS-specific values must reach the bootstrap request, not stop at an intermediate struct. |
+| Labels versus configuration | [Surface guidance](./0015-nodeclass-vs-labels.md), [Ultra SSD design](./0013-ultra-ssd-support.md), and upstream [1704](https://github.com/Azure/karpenter-provider-azure/pull/1704). | Capability support, selected configuration, and scheduling intent are different concepts. |
+| Cluster-dependent resolution | [LocalDNS reconciler](../pkg/controllers/nodeclass/status/localdns.go) and its sibling tests. | Single ownership, readiness, observation, and wire translation matter; sticky semantics are feature-specific. |
+| Mutable resources | [In-place update controller](../pkg/controllers/nodeclaim/inplaceupdate/controller.go) and [utils](../pkg/controllers/nodeclaim/inplaceupdate/utils.go). | Hash exclusion alone does not implement updates; predicates, patchers, retries, and evidence are required. |
 
-### Should I add the field to `v1alpha2` for parity?
+### Category-specific checks
 
-No. `v1alpha2` is deprecated and planned for removal.
-
-### Where do my constants go?
-
-Next to the code that uses them, unexported, unless genuinely cross-cutting.
-`pkg/consts/consts.go` is for values shared across packages.
-
-### Do I need a CEL rule to enforce uniqueness in a list?
-
-No, if the list uses `listType=map` — it enforces uniqueness on the map key. Keep a
-`maxItems` bound anyway.
-
-### The feature needs a label *and* NodeClass configuration.
-
-Re-read `0015`'s "Special Case" section. Only `os-sku` and `fips_enabled` do this today and
-it is discouraged, because it creates two ways to express one thing.
+| Category | Additional seams to inspect |
+|---|---|
+| Networking | NodeClass versus operator subnet precedence; plugin/dataplane-dependent labels and `maxPods`; NIC ownership/GC; subnet, NSG, and route behavior in Azure. Extend existing networking tables rather than duplicating them. |
+| Security | SKU capability, image lineage, FIPS/Trusted Launch interlocks, least-privilege permissions, and patch-log redaction. Re-derive interacting validation rules when adding another security input. |
+| Storage | Capability versus paid enablement; managed/ephemeral OS disk constraints; zonal/regional availability; attach/use behavior and resource cleanup. |
+| Bootstrap / GPU | Every supported image family, architecture, Kubernetes version, units/conversions, driver ownership, and actual service/runtime readiness. |
+| Capacity / scheduling | Offering-level constraints, pricing/quota/consolidation effects, error classification, and consistent placement values in both requirements and node labels. |
