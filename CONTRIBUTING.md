@@ -41,6 +41,14 @@ Q: When running some of the tests locally, the environment failed to start. How 
 
 A: Oftentimes, especially for pre-existing tests, running `make toolchain` will fix this. This target will ensure that you have the correct versions of binaries installed.
 
+## Adding an Azure or AKS feature
+
+Follow the [feature enablement guide](designs/0000-feature-enablement-guide.md) for the
+proposal, API and scheduling decisions, implementation checklist, compatibility evidence,
+and pull request expectations. Start with an issue and design feedback before committing
+to a new public API. The guide also explains how to request maintainer-assisted Azure
+testing when you do not have access to the required infrastructure.
+
 ## Testing
 We have three types of testing:
 * Unit Tests
